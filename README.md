@@ -56,6 +56,8 @@ The configuration contains only the page URL and recipient addresses—never an 
 
 The monitor follows changes on the MDOT page and hashes directly linked files hosted by MDOT. It records the presence, title, and URL of third-party links but does not crawl or hash external websites.
 
+One ProjectWise-hosted PDF, `RWD Workflow Training ORD`, is explicitly included through the `extra_documents` configuration. The monitor does not follow any other links embedded inside PDFs.
+
 ## Tests
 
 ```powershell

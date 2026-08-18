@@ -102,6 +102,13 @@ New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
     page_url = 'https://mdot.ms.gov/portal/engineering_standards_guides_manuals'
     recipients = $recipientAddresses
     failure_recipient = $FailureRecipient
+    extra_documents = @(
+        @{
+            title = 'RWD Workflow Training ORD'
+            url = 'https://pwdocs.mdot.state.ms.us/Resources/Services/ProjectWise/Download.ashx/View?connectionId=default&key=ECObjects%7CBentley_DMS%7CDMSDocument%7C28599_4&view=inline&provider=Bentley.ECOM.ProjectWiseProvider&location=PWINTG.MDOT.STATE.MS.US%3AMDOT'
+            section = 'Explicitly monitored documents'
+        }
+    )
 } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $configFile -Encoding UTF8
 
 $pythonArguments = if ([IO.Path]::GetFileName($pythonLauncher) -ieq 'py.exe') {

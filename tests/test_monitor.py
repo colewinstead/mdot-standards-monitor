@@ -57,6 +57,14 @@ class HashTests(unittest.TestCase):
             with self.assertRaises(monitor.MonitorError):
                 monitor.download_document(item)
 
+    def test_projectwise_download_is_identified_as_pdf_from_headers(self):
+        extension = monitor.infer_document_extension(
+            "https://pwdocs.mdot.state.ms.us/Resources/Services/ProjectWise/Download.ashx/View?key=123",
+            "application/pdf",
+            'inline; filename="RWD_Workflow_Training_ORD.pdf"',
+        )
+        self.assertEqual(".pdf", extension)
+
 
 def snapshot(text="Page", documents=None, links=None):
     return {
@@ -248,6 +256,20 @@ class StorageAndEmailTests(unittest.TestCase):
             try:
                 monitor.CONFIG_FILE = Path(directory) / "config.json"
                 monitor.atomic_write_json(monitor.CONFIG_FILE, {"recipients": "not-a-list"})
+                with self.assertRaises(monitor.MonitorError):
+                    monitor.load_config()
+            finally:
+                monitor.CONFIG_FILE = old_path
+
+    def test_config_rejects_malformed_extra_document(self):
+        old_path = monitor.CONFIG_FILE
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                monitor.CONFIG_FILE = Path(directory) / "config.json"
+                monitor.atomic_write_json(
+                    monitor.CONFIG_FILE,
+                    {"recipients": [], "extra_documents": [{"url": "https://example.com/file.pdf"}]},
+                )
                 with self.assertRaises(monitor.MonitorError):
                     monitor.load_config()
             finally:

@@ -253,6 +253,7 @@ def download_document(item: dict[str, str], timeout_seconds: int = 180) -> dict[
                 "sha256": digest.hexdigest(),
                 "size": size,
                 "content_type": response.headers.get_content_type(),
+                "content_disposition": response.headers.get("Content-Disposition", ""),
                 "etag": response.headers.get("ETag", ""),
                 "last_modified": response.headers.get("Last-Modified", ""),
                 "_temp_path": str(temp_path),
@@ -275,7 +276,7 @@ def analyze_pdf(path: Path) -> dict[str, object]:
 
     pages: list[dict[str, object]] = []
     try:
-        with pymupdf.open(path) as document:
+        with pymupdf.open(path, filetype="pdf") as document:
             for index, page in enumerate(document):
                 text = "\n".join(normalized_lines(page.get_text("text", sort=True)))
                 # A low-resolution grayscale rendering catches drawings and scanned pages
@@ -383,8 +384,40 @@ def analyze_text_file(path: Path) -> dict[str, object]:
     return {"kind": "lines", "lines": normalized_lines(text)}
 
 
-def analyze_document(path: Path, url: str) -> dict[str, object]:
+def infer_document_extension(
+    url: str,
+    content_type: str = "",
+    content_disposition: str = "",
+) -> str:
     extension = Path(unquote(urlsplit(url).path)).suffix.lower()
+    if extension in DOCUMENT_EXTENSIONS:
+        return extension
+    filename_match = re.search(
+        r"filename\*?=(?:UTF-8''|\")?([^\";]+)",
+        content_disposition,
+        flags=re.IGNORECASE,
+    )
+    if filename_match:
+        disposition_extension = Path(unquote(filename_match.group(1).strip())).suffix.lower()
+        if disposition_extension:
+            return disposition_extension
+    return {
+        "application/pdf": ".pdf",
+        "text/plain": ".txt",
+        "text/csv": ".csv",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "application/vnd.ms-excel.sheet.macroenabled.12": ".xlsm",
+    }.get(content_type.lower(), extension)
+
+
+def analyze_document(
+    path: Path,
+    url: str,
+    content_type: str = "",
+    content_disposition: str = "",
+) -> dict[str, object]:
+    extension = infer_document_extension(url, content_type, content_disposition)
     if extension == ".pdf":
         return analyze_pdf(path)
     if extension in {".docx", ".docm"}:
@@ -404,10 +437,23 @@ def build_snapshot(
     logger: logging.Logger,
     previous_snapshot: dict[str, object] | None = None,
     force_analysis: bool = False,
+    extra_documents: list[dict[str, str]] | None = None,
 ) -> dict[str, object]:
     rendered = render_page(page_url)
     page = parse_rendered_page(rendered, page_url)
     document_links = [item for item in page["links"] if is_mdot_document(item["url"])]
+    known_urls = {item["url"] for item in document_links}
+    for extra in extra_documents or []:
+        extra_url = canonicalize_url(page_url, str(extra["url"]))
+        if extra_url not in known_urls:
+            document_links.append(
+                {
+                    "url": extra_url,
+                    "title": normalize_text(str(extra["title"])),
+                    "section": normalize_text(str(extra.get("section", "Explicitly monitored documents"))),
+                }
+            )
+            known_urls.add(extra_url)
     logger.info("Rendered page with %d links and %d MDOT documents", len(page["links"]), len(document_links))
     previous_documents = {
         item["url"]: item for item in (previous_snapshot or {}).get("documents", [])
@@ -428,7 +474,12 @@ def build_snapshot(
                 downloaded["analysis"] = previous["analysis"]
             else:
                 logger.info("Creating detailed content snapshot: %s", item["title"])
-                downloaded["analysis"] = analyze_document(temp_path, item["url"])
+                downloaded["analysis"] = analyze_document(
+                    temp_path,
+                    item["url"],
+                    str(downloaded.get("content_type", "")),
+                    str(downloaded.get("content_disposition", "")),
+                )
             documents.append(downloaded)
         finally:
             temp_path.unlink(missing_ok=True)
@@ -785,6 +836,7 @@ def load_config(require_recipients: bool = False) -> dict[str, object]:
     config.setdefault("page_url", DEFAULT_URL)
     config.setdefault("recipients", [])
     config.setdefault("failure_recipient", "")
+    config.setdefault("extra_documents", [])
     recipients = config["recipients"]
     if not isinstance(recipients, list):
         raise MonitorError(f"recipients must be a list in {CONFIG_FILE}")
@@ -792,6 +844,11 @@ def load_config(require_recipients: bool = False) -> dict[str, object]:
         raise MonitorError(f"No recipients are configured. Run install.ps1 first. Config: {CONFIG_FILE}")
     if not isinstance(config["failure_recipient"], str):
         raise MonitorError(f"failure_recipient must be a string in {CONFIG_FILE}")
+    if not isinstance(config["extra_documents"], list) or any(
+        not isinstance(item, dict) or not item.get("url") or not item.get("title")
+        for item in config["extra_documents"]
+    ):
+        raise MonitorError(f"extra_documents must be a list of objects with url and title in {CONFIG_FILE}")
     return config
 
 
@@ -857,8 +914,9 @@ def run_check(args: argparse.Namespace) -> int:
             snapshot = build_snapshot(
                 str(config["page_url"]),
                 logger,
-                previous_snapshot=None if args.initialize else baseline,
-                force_analysis=args.initialize,
+                previous_snapshot=baseline,
+                force_analysis=False,
+                extra_documents=list(config.get("extra_documents", [])),
             )
             if args.dry_run:
                 if baseline:
