@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest import mock
 from urllib.error import URLError
+import zipfile
 from pathlib import Path
 import sys
 
@@ -105,6 +106,98 @@ class ComparisonTests(unittest.TestCase):
         self.assertTrue(changes["page_text_changed"])
         self.assertEqual(1, len(changes["links_added"]))
         self.assertEqual(1, len(changes["links_renamed"]))
+        self.assertTrue(changes["page_text_details"])
+        self.assertEqual(3, monitor.change_count(changes))
+
+
+class DetailedComparisonTests(unittest.TestCase):
+    def test_pdf_reports_changed_page_number_and_text(self):
+        import pymupdf
+
+        with tempfile.TemporaryDirectory() as directory:
+            old_path = Path(directory) / "old.pdf"
+            new_path = Path(directory) / "new.pdf"
+            for path, second_page_text in ((old_path, "Original requirement"), (new_path, "Revised requirement")):
+                document_file = pymupdf.open()
+                first = document_file.new_page()
+                first.insert_text((72, 72), "Unchanged cover")
+                second = document_file.new_page()
+                second.insert_text((72, 72), second_page_text)
+                document_file.save(path)
+                document_file.close()
+
+            details = monitor.describe_pdf_changes(
+                monitor.analyze_pdf(old_path),
+                monitor.analyze_pdf(new_path),
+            )
+            self.assertTrue(any("Page 2 changed" in detail for detail in details))
+            self.assertTrue(any("Original requirement" in detail for detail in details))
+            self.assertTrue(any("Revised requirement" in detail for detail in details))
+
+    def test_word_paragraph_changes_are_described(self):
+        details = monitor.describe_analysis_changes(
+            {"analysis": {"kind": "paragraphs", "paragraphs": ["Keep", "Old paragraph"]}},
+            {"analysis": {"kind": "paragraphs", "paragraphs": ["Keep", "New paragraph"]}},
+        )
+        self.assertTrue(any("Paragraph(s) 2 changed" in detail for detail in details))
+        self.assertTrue(any("Old paragraph" in detail and "New paragraph" in detail for detail in details))
+
+    def test_excel_reports_sheet_and_cell(self):
+        details = monitor.describe_excel_changes(
+            {"cells": [{"sheet": "Pay Items", "cell": "B7", "value": "100"}]},
+            {"cells": [{"sheet": "Pay Items", "cell": "B7", "value": "125"}]},
+        )
+        self.assertEqual(["Pay Items!B7 changed: 100 → 125"], details)
+
+    def test_tolerant_excel_parser_extracts_shared_string_and_formula(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sample.xlsm"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "xl/workbook.xml",
+                    """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                    <sheets><sheet name="Pay Items" sheetId="1" r:id="rId1"/></sheets></workbook>""",
+                )
+                archive.writestr(
+                    "xl/_rels/workbook.xml.rels",
+                    """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                    <Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>""",
+                )
+                archive.writestr(
+                    "xl/sharedStrings.xml",
+                    """<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                    <si><t>Bridge item</t></si></sst>""",
+                )
+                archive.writestr(
+                    "xl/worksheets/sheet1.xml",
+                    """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                    <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c>
+                    <c r="B1"><f>SUM(1,2)</f><v>3</v></c></row></sheetData></worksheet>""",
+                )
+            analysis = monitor.analyze_excel(path)
+            self.assertIn({"sheet": "Pay Items", "cell": "A1", "value": "Bridge item"}, analysis["cells"])
+            self.assertIn({"sheet": "Pay Items", "cell": "B1", "value": "=SUM(1,2)"}, analysis["cells"])
+
+    def test_email_includes_detailed_change_lines(self):
+        old = snapshot(documents=[document("https://mdot.ms.gov/documents/a.pdf", "A", "old")])
+        new = snapshot(documents=[document("https://mdot.ms.gov/documents/a.pdf", "A", "new")])
+        changes = monitor.compare_snapshots(old, new)
+        changes["documents_modified"][0]["details"] = ["Page 7 changed — Added: revised value"]
+        new.update({"generated_at": "now", "page_url": monitor.DEFAULT_URL})
+        body = monitor.format_change_email(changes, new)
+        self.assertIn("Page 7 changed", body)
+        self.assertIn("revised value", body)
+
+    def test_page_text_email_shows_old_and_new_wording(self):
+        old = snapshot(text="Design manual effective January 2025")
+        new = snapshot(text="Design manual effective July 2026")
+        changes = monitor.compare_snapshots(old, new)
+        new.update({"generated_at": "now", "page_url": monitor.DEFAULT_URL})
+        body = monitor.format_change_email(changes, new)
+        self.assertIn("January 2025", body)
+        self.assertIn("July 2026", body)
+        self.assertEqual(1, monitor.change_count(changes))
 
 
 class StorageAndEmailTests(unittest.TestCase):

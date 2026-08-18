@@ -1,6 +1,8 @@
 # MDOT Standards Monitor
 
-This Windows utility checks the MDOT Engineering Standards/Guides/Manuals page every day. It renders the JavaScript page in Chrome, compares meaningful page content and links, and SHA-256 hashes every directly linked MDOT document. When something changes, it sends an HTML summary through the signed-in Classic Outlook profile.
+This Windows utility checks the MDOT Engineering Standards/Guides/Manuals page every weekday. It renders the JavaScript page in Chrome, compares meaningful page content and links, and SHA-256 hashes every directly linked MDOT document. When something changes, it sends an HTML summary through the signed-in Classic Outlook profile.
+
+For modified files, the report also identifies PDF page numbers and text excerpts, Word paragraph changes, Excel sheet/cell changes, and text-file line changes. PDF page snapshots include a low-resolution visual fingerprint so changes to drawings or scanned pages can still be assigned to a page even when no text can be extracted.
 
 ## Install
 
@@ -44,7 +46,7 @@ py -3.14 .\monitor.py send-preview
 
 ## Data and troubleshooting
 
-Configuration, the current baseline, failure state, and rotating logs are stored in:
+Configuration, the current baseline (including detailed page/content snapshots), failure state, and rotating logs are stored in:
 
 ```text
 %LOCALAPPDATA%\MDOTStandardsMonitor

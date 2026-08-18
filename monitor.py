@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import html as html_module
 import json
@@ -16,12 +17,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from datetime import datetime
 from html.parser import HTMLParser
 from typing import BinaryIO, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 
 APP_NAME = "MDOTStandardsMonitor"
@@ -228,32 +231,207 @@ def hash_stream(stream: BinaryIO, chunk_size: int = 1024 * 1024) -> tuple[str, i
 
 def download_document(item: dict[str, str], timeout_seconds: int = 180) -> dict[str, object]:
     request = Request(item["url"], headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+    suffix = Path(unquote(urlsplit(item["url"]).path)).suffix.lower() or ".download"
+    temp_path: Path | None = None
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            digest, size = hash_stream(response)
+        with tempfile.NamedTemporaryFile("wb", suffix=suffix, delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+            with urlopen(request, timeout=timeout_seconds) as response:
+                digest = hashlib.sha256()
+                size = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    temp_file.write(chunk)
+                    size += len(chunk)
             return {
                 "url": item["url"],
                 "title": item["title"],
                 "section": item["section"],
-                "sha256": digest,
+                "sha256": digest.hexdigest(),
                 "size": size,
                 "content_type": response.headers.get_content_type(),
                 "etag": response.headers.get("ETag", ""),
                 "last_modified": response.headers.get("Last-Modified", ""),
+                "_temp_path": str(temp_path),
             }
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
         raise MonitorError(f"Could not download {item['title']} ({item['url']}): {exc}") from exc
 
 
-def build_snapshot(page_url: str, logger: logging.Logger) -> dict[str, object]:
+def normalized_lines(value: str) -> list[str]:
+    return [normalize_text(line) for line in value.splitlines() if normalize_text(line)]
+
+
+def analyze_pdf(path: Path) -> dict[str, object]:
+    try:
+        import pymupdf
+    except ImportError as exc:
+        raise MonitorError("PyMuPDF is required for page-level PDF comparisons") from exc
+
+    pages: list[dict[str, object]] = []
+    try:
+        with pymupdf.open(path) as document:
+            for index, page in enumerate(document):
+                text = "\n".join(normalized_lines(page.get_text("text", sort=True)))
+                # A low-resolution grayscale rendering catches drawings and scanned pages
+                # that contain little or no extractable text.
+                pixmap = page.get_pixmap(dpi=48, colorspace=pymupdf.csGRAY, alpha=False, annots=True)
+                pages.append(
+                    {
+                        "page": index + 1,
+                        "text": text,
+                        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                        "visual_sha256": hashlib.sha256(pixmap.samples).hexdigest(),
+                    }
+                )
+    except Exception as exc:
+        raise MonitorError(f"Could not analyze PDF {path.name}: {exc}") from exc
+    return {"kind": "pdf_pages", "pages": pages}
+
+
+def analyze_word(path: Path) -> dict[str, object]:
+    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    try:
+        with zipfile.ZipFile(path) as archive:
+            root = ElementTree.fromstring(archive.read("word/document.xml"))
+    except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        raise MonitorError(f"Could not analyze Word document {path.name}: {exc}") from exc
+    paragraphs: list[str] = []
+    for paragraph in root.iter(namespace + "p"):
+        text = normalize_text("".join(node.text or "" for node in paragraph.iter(namespace + "t")))
+        if text:
+            paragraphs.append(text)
+    return {"kind": "paragraphs", "paragraphs": paragraphs}
+
+
+def analyze_excel(path: Path) -> dict[str, object]:
+    cells: list[dict[str, str]] = []
+    spreadsheet_ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    relationship_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    package_relationship_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    try:
+        with zipfile.ZipFile(path) as archive:
+            shared_strings: list[str] = []
+            if "xl/sharedStrings.xml" in archive.namelist():
+                shared_root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+                for item in shared_root.iter(spreadsheet_ns + "si"):
+                    shared_strings.append(
+                        normalize_text("".join(node.text or "" for node in item.iter(spreadsheet_ns + "t")))
+                    )
+
+            relationship_root = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            relationships = {
+                relation.attrib["Id"]: relation.attrib["Target"]
+                for relation in relationship_root.iter(package_relationship_ns + "Relationship")
+            }
+            workbook_root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+            for sheet in workbook_root.iter(spreadsheet_ns + "sheet"):
+                sheet_name = sheet.attrib.get("name", "Worksheet")
+                relationship_id = sheet.attrib.get(relationship_ns + "id", "")
+                target = relationships.get(relationship_id, "")
+                if not target:
+                    continue
+                worksheet_path = target.lstrip("/")
+                if not worksheet_path.startswith("xl/"):
+                    worksheet_path = "xl/" + worksheet_path
+                worksheet_root = ElementTree.fromstring(archive.read(worksheet_path))
+                for cell in worksheet_root.iter(spreadsheet_ns + "c"):
+                    coordinate = cell.attrib.get("r", "")
+                    cell_type = cell.attrib.get("t", "")
+                    formula = cell.find(spreadsheet_ns + "f")
+                    value_node = cell.find(spreadsheet_ns + "v")
+                    if formula is not None and formula.text is not None:
+                        value = "=" + formula.text
+                    elif cell_type == "inlineStr":
+                        value = "".join(node.text or "" for node in cell.iter(spreadsheet_ns + "t"))
+                    elif value_node is None or value_node.text is None:
+                        continue
+                    elif cell_type == "s":
+                        try:
+                            value = shared_strings[int(value_node.text)]
+                        except (ValueError, IndexError):
+                            value = value_node.text
+                    else:
+                        value = value_node.text
+                    cells.append(
+                        {
+                            "sheet": sheet_name,
+                            "cell": coordinate,
+                            "value": normalize_text(str(value)),
+                        }
+                    )
+    except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        raise MonitorError(f"Could not analyze Excel workbook {path.name}: {exc}") from exc
+    return {"kind": "excel_cells", "cells": cells}
+
+
+def analyze_text_file(path: Path) -> dict[str, object]:
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-16", "cp1252"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("utf-8", errors="replace")
+    return {"kind": "lines", "lines": normalized_lines(text)}
+
+
+def analyze_document(path: Path, url: str) -> dict[str, object]:
+    extension = Path(unquote(urlsplit(url).path)).suffix.lower()
+    if extension == ".pdf":
+        return analyze_pdf(path)
+    if extension in {".docx", ".docm"}:
+        return analyze_word(path)
+    if extension in {".xlsx", ".xlsm"}:
+        return analyze_excel(path)
+    if extension in {".txt", ".csv"}:
+        return analyze_text_file(path)
+    return {
+        "kind": "unsupported",
+        "reason": f"Detailed comparison is not available for {extension or 'this file type'}",
+    }
+
+
+def build_snapshot(
+    page_url: str,
+    logger: logging.Logger,
+    previous_snapshot: dict[str, object] | None = None,
+    force_analysis: bool = False,
+) -> dict[str, object]:
     rendered = render_page(page_url)
     page = parse_rendered_page(rendered, page_url)
     document_links = [item for item in page["links"] if is_mdot_document(item["url"])]
     logger.info("Rendered page with %d links and %d MDOT documents", len(page["links"]), len(document_links))
+    previous_documents = {
+        item["url"]: item for item in (previous_snapshot or {}).get("documents", [])
+    }
     documents = []
     for index, item in enumerate(document_links, start=1):
         logger.info("Hashing document %d/%d: %s", index, len(document_links), item["title"])
-        documents.append(download_document(item))
+        downloaded = download_document(item)
+        temp_path = Path(str(downloaded.pop("_temp_path")))
+        try:
+            previous = previous_documents.get(item["url"])
+            if (
+                not force_analysis
+                and previous
+                and previous.get("sha256") == downloaded["sha256"]
+                and previous.get("analysis")
+            ):
+                downloaded["analysis"] = previous["analysis"]
+            else:
+                logger.info("Creating detailed content snapshot: %s", item["title"])
+                downloaded["analysis"] = analyze_document(temp_path, item["url"])
+            documents.append(downloaded)
+        finally:
+            temp_path.unlink(missing_ok=True)
     documents.sort(key=lambda item: item["url"].casefold())
     return {
         "schema_version": 1,
@@ -263,6 +441,159 @@ def build_snapshot(page_url: str, logger: logging.Logger) -> dict[str, object]:
         "links": page["links"],
         "documents": documents,
     }
+
+
+def compact_excerpt(old_lines: list[str], new_lines: list[str], limit: int = 700) -> str:
+    removed: list[str] = []
+    added: list[str] = []
+    for line in difflib.ndiff(old_lines, new_lines):
+        if line.startswith("- ") and len(removed) < 3:
+            removed.append(line[2:])
+        elif line.startswith("+ ") and len(added) < 3:
+            added.append(line[2:])
+    parts = []
+    if removed:
+        parts.append("Removed: " + " | ".join(removed))
+    if added:
+        parts.append("Added: " + " | ".join(added))
+    excerpt = " ".join(parts) or "Content changed"
+    return excerpt[:limit] + ("…" if len(excerpt) > limit else "")
+
+
+def range_label(numbers: list[int]) -> str:
+    if not numbers:
+        return ""
+    return str(numbers[0]) if len(numbers) == 1 else f"{numbers[0]}–{numbers[-1]}"
+
+
+def describe_pdf_changes(old: dict[str, object], new: dict[str, object]) -> list[str]:
+    old_pages = list(old.get("pages", []))
+    new_pages = list(new.get("pages", []))
+    old_signatures = [page.get("visual_sha256") or page.get("text_sha256") for page in old_pages]
+    new_signatures = [page.get("visual_sha256") or page.get("text_sha256") for page in new_pages]
+    matcher = difflib.SequenceMatcher(a=old_signatures, b=new_signatures, autojunk=False)
+    details: list[str] = []
+    for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if operation == "equal":
+            continue
+        if operation == "delete":
+            pages = [int(page["page"]) for page in old_pages[old_start:old_end]]
+            details.append(f"Old page(s) {range_label(pages)} removed")
+            continue
+        if operation == "insert":
+            pages = [int(page["page"]) for page in new_pages[new_start:new_end]]
+            details.append(f"New page(s) {range_label(pages)} added")
+            continue
+
+        old_block = old_pages[old_start:old_end]
+        new_block = new_pages[new_start:new_end]
+        paired = min(len(old_block), len(new_block))
+        for index in range(paired):
+            old_page, new_page = old_block[index], new_block[index]
+            old_number, new_number = int(old_page["page"]), int(new_page["page"])
+            label = f"Page {new_number}" if old_number == new_number else f"Old page {old_number} / new page {new_number}"
+            excerpt = compact_excerpt(
+                normalized_lines(str(old_page.get("text", ""))),
+                normalized_lines(str(new_page.get("text", ""))),
+            )
+            details.append(f"{label} changed — {excerpt}")
+        if len(old_block) > paired:
+            pages = [int(page["page"]) for page in old_block[paired:]]
+            details.append(f"Old page(s) {range_label(pages)} removed")
+        if len(new_block) > paired:
+            pages = [int(page["page"]) for page in new_block[paired:]]
+            details.append(f"New page(s) {range_label(pages)} added")
+    if not details:
+        details.append("File packaging or metadata changed; no rendered page difference was found")
+    return details[:20] + ([f"{len(details) - 20} additional page change(s) omitted"] if len(details) > 20 else [])
+
+
+def describe_sequence_changes(
+    old_items: list[str],
+    new_items: list[str],
+    item_name: str,
+) -> list[str]:
+    matcher = difflib.SequenceMatcher(a=old_items, b=new_items, autojunk=False)
+    details: list[str] = []
+    for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if operation == "equal":
+            continue
+        old_numbers = list(range(old_start + 1, old_end + 1))
+        new_numbers = list(range(new_start + 1, new_end + 1))
+        if operation == "insert":
+            details.append(f"{item_name.title()}(s) {range_label(new_numbers)} added — {compact_excerpt([], new_items[new_start:new_end])}")
+        elif operation == "delete":
+            details.append(f"Old {item_name}(s) {range_label(old_numbers)} removed — {compact_excerpt(old_items[old_start:old_end], [])}")
+        else:
+            details.append(
+                f"{item_name.title()}(s) {range_label(new_numbers)} changed — "
+                f"{compact_excerpt(old_items[old_start:old_end], new_items[new_start:new_end])}"
+            )
+    return details[:20] + ([f"{len(details) - 20} additional change group(s) omitted"] if len(details) > 20 else [])
+
+
+def describe_excel_changes(old: dict[str, object], new: dict[str, object]) -> list[str]:
+    def cells(analysis: dict[str, object]) -> dict[tuple[str, str], str]:
+        return {
+            (str(item["sheet"]), str(item["cell"])): str(item.get("value", ""))
+            for item in analysis.get("cells", [])
+        }
+
+    old_cells, new_cells = cells(old), cells(new)
+    details: list[str] = []
+    for key in sorted(set(old_cells) | set(new_cells)):
+        sheet, cell = key
+        if key not in old_cells:
+            details.append(f"{sheet}!{cell} added: {new_cells[key][:300]}")
+        elif key not in new_cells:
+            details.append(f"{sheet}!{cell} removed: {old_cells[key][:300]}")
+        elif old_cells[key] != new_cells[key]:
+            details.append(f"{sheet}!{cell} changed: {old_cells[key][:150]} → {new_cells[key][:150]}")
+    return details[:20] + ([f"{len(details) - 20} additional cell change(s) omitted"] if len(details) > 20 else [])
+
+
+def describe_analysis_changes(old: dict[str, object], new: dict[str, object]) -> list[str]:
+    old_analysis = old.get("analysis") or {}
+    new_analysis = new.get("analysis") or {}
+    if old_analysis.get("kind") != new_analysis.get("kind"):
+        return ["The document format or detailed-analysis method changed"]
+    kind = new_analysis.get("kind")
+    if kind == "pdf_pages":
+        return describe_pdf_changes(old_analysis, new_analysis)
+    if kind == "paragraphs":
+        return describe_sequence_changes(
+            list(old_analysis.get("paragraphs", [])),
+            list(new_analysis.get("paragraphs", [])),
+            "paragraph",
+        )
+    if kind == "lines":
+        return describe_sequence_changes(
+            list(old_analysis.get("lines", [])),
+            list(new_analysis.get("lines", [])),
+            "line",
+        )
+    if kind == "excel_cells":
+        return describe_excel_changes(old_analysis, new_analysis)
+    return [str(new_analysis.get("reason", "Detailed internal comparison is unavailable for this file type"))]
+
+
+def describe_page_text_changes(old_text: str, new_text: str) -> list[str]:
+    old_words = old_text.split()
+    new_words = new_text.split()
+    matcher = difflib.SequenceMatcher(a=old_words, b=new_words, autojunk=False)
+    details: list[str] = []
+    for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if operation == "equal":
+            continue
+        old_value = " ".join(old_words[old_start:old_end])
+        new_value = " ".join(new_words[new_start:new_end])
+        if operation == "insert":
+            details.append(f"Added: {new_value[:500]}")
+        elif operation == "delete":
+            details.append(f"Removed: {old_value[:500]}")
+        else:
+            details.append(f"Changed: {old_value[:250]} → {new_value[:250]}")
+    return details[:10] + ([f"{len(details) - 10} additional text change(s) omitted"] if len(details) > 10 else [])
 
 
 def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[str, object]:
@@ -282,7 +613,11 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
             added_urls.remove(match)
 
     modified = [
-        {"old": old_docs[url], "new": new_docs[url]}
+        {
+            "old": old_docs[url],
+            "new": new_docs[url],
+            "details": describe_analysis_changes(old_docs[url], new_docs[url]),
+        }
         for url in sorted(set(old_docs) & set(new_docs))
         if old_docs[url].get("sha256") != new_docs[url].get("sha256")
     ]
@@ -305,6 +640,10 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
     ]
     return {
         "page_text_changed": old.get("page_text") != new.get("page_text"),
+        "page_text_details": describe_page_text_changes(
+            str(old.get("page_text", "")),
+            str(new.get("page_text", "")),
+        ),
         "documents_added": [new_docs[url] for url in sorted(added_urls)],
         "documents_removed": [old_docs[url] for url in sorted(removed_urls)],
         "documents_modified": modified,
@@ -317,12 +656,21 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
 
 
 def has_changes(changes: dict[str, object]) -> bool:
-    return bool(changes["page_text_changed"] or any(changes[key] for key in changes if key != "page_text_changed"))
+    return bool(
+        changes["page_text_changed"]
+        or any(
+            changes[key]
+            for key in changes
+            if key not in {"page_text_changed", "page_text_details"}
+        )
+    )
 
 
 def change_count(changes: dict[str, object]) -> int:
     return int(bool(changes["page_text_changed"])) + sum(
-        len(value) for key, value in changes.items() if key != "page_text_changed"
+        len(value)
+        for key, value in changes.items()
+        if key not in {"page_text_changed", "page_text_details"}
     )
 
 
@@ -335,16 +683,31 @@ def format_change_email(changes: dict[str, object], snapshot: dict[str, object])
         if rendered:
             sections.append(f"<h3>{e(title)}</h3><ul>" + "".join(f"<li>{formatter(item)}</li>" for item in rendered) + "</ul>")
 
+    def modified_document(item: dict[str, object]) -> str:
+        new_document = item["new"]
+        details = list(item.get("details", []))
+        detail_html = ""
+        if details:
+            detail_html = "<ul>" + "".join(f"<li>{e(str(detail))}</li>" for detail in details) + "</ul>"
+        return f'<a href="{e(str(new_document["url"]))}">{e(str(new_document["title"]))}</a>{detail_html}'
+
     doc_list("Documents added", changes["documents_added"], lambda x: f'<a href="{e(str(x["url"]))}">{e(str(x["title"]))}</a>')
     doc_list("Documents removed", changes["documents_removed"], lambda x: e(str(x["title"])))
-    doc_list("Document contents modified", changes["documents_modified"], lambda x: f'<a href="{e(str(x["new"]["url"]))}">{e(str(x["new"]["title"]))}</a>')
+    doc_list("Document contents modified", changes["documents_modified"], modified_document)
     doc_list("Documents renamed", changes["documents_renamed"], lambda x: f'{e(str(x["old"]["title"]))} &rarr; <a href="{e(str(x["new"]["url"]))}">{e(str(x["new"]["title"]))}</a>')
     doc_list("Documents moved or replaced at a new URL", changes["documents_moved"], lambda x: f'{e(str(x["old"]["url"]))} &rarr; <a href="{e(str(x["new"]["url"]))}">{e(str(x["new"]["title"]))}</a>')
     doc_list("Links added", changes["links_added"], lambda x: f'<a href="{e(str(x["url"]))}">{e(str(x["title"]))}</a>')
     doc_list("Links removed", changes["links_removed"], lambda x: e(f'{x["title"]} ({x["url"]})'))
     doc_list("Link titles changed", changes["links_renamed"], lambda x: f'{e(str(x["old_title"]))} &rarr; <a href="{e(str(x["url"]))}">{e(str(x["new_title"]))}</a>')
     if changes["page_text_changed"]:
-        sections.insert(0, "<h3>Page content changed</h3><p>Visible headings or explanatory text changed.</p>")
+        page_details = list(changes.get("page_text_details", []))
+        detail_html = ""
+        if page_details:
+            detail_html = "<ul>" + "".join(f"<li>{e(str(detail))}</li>" for detail in page_details) + "</ul>"
+        sections.insert(
+            0,
+            "<h3>Page content changed</h3><p>Visible headings or explanatory text changed.</p>" + detail_html,
+        )
     checked = e(str(snapshot["generated_at"]))
     page_url = e(str(snapshot["page_url"]))
     return (
@@ -490,8 +853,13 @@ def run_check(args: argparse.Namespace) -> int:
     config = load_config(require_recipients=False)
     with FileLock():
         try:
-            snapshot = build_snapshot(str(config["page_url"]), logger)
             baseline = read_json(STATE_FILE)
+            snapshot = build_snapshot(
+                str(config["page_url"]),
+                logger,
+                previous_snapshot=None if args.initialize else baseline,
+                force_analysis=args.initialize,
+            )
             if args.dry_run:
                 if baseline:
                     changes = compare_snapshots(baseline, snapshot)
@@ -578,6 +946,9 @@ def send_change_preview() -> int:
             {
                 "old": {"url": modified_example["url"], "title": modified_example["title"], "sha256": "example-old"},
                 "new": {"url": modified_example["url"], "title": f'Example modified content — {modified_example["title"]}', "sha256": "example-updated"},
+                "details": [
+                    "Page 7 changed — Removed: Minimum thickness 6 inches | Added: Minimum thickness 8 inches"
+                ],
             }
         ],
         "documents_renamed": [

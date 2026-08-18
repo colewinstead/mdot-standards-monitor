@@ -13,6 +13,7 @@ $taskName = 'MDOT Standards Daily Monitor'
 $dataDirectory = Join-Path $env:LOCALAPPDATA 'MDOTStandardsMonitor'
 $configFile = Join-Path $dataDirectory 'config.json'
 $monitorScript = Join-Path $PSScriptRoot 'monitor.py'
+$requirementsFile = Join-Path $PSScriptRoot 'requirements.txt'
 
 if ($Remove) {
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -33,6 +34,30 @@ if (-not (Test-Path -LiteralPath $monitorScript -PathType Leaf)) {
 $pythonLauncher = (Get-Command py.exe -ErrorAction SilentlyContinue).Source
 if (-not $pythonLauncher) {
     $pythonLauncher = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
+}
+
+$dependencyCheckArguments = if ([IO.Path]::GetFileName($pythonLauncher) -ieq 'py.exe') {
+    @('-3.14', '-c', 'import pymupdf')
+}
+else {
+    @('-c', 'import pymupdf')
+}
+& $pythonLauncher @dependencyCheckArguments 2>$null
+if ($LASTEXITCODE -ne 0) {
+    if (-not (Test-Path -LiteralPath $requirementsFile -PathType Leaf)) {
+        throw "Dependency list was not found: $requirementsFile"
+    }
+    Write-Host 'Installing PDF and Excel comparison support...'
+    $installDependencyArguments = if ([IO.Path]::GetFileName($pythonLauncher) -ieq 'py.exe') {
+        @('-3.14', '-m', 'pip', 'install', '--user', '-r', $requirementsFile)
+    }
+    else {
+        @('-m', 'pip', 'install', '--user', '-r', $requirementsFile)
+    }
+    & $pythonLauncher @installDependencyArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Required Python packages could not be installed.'
+    }
 }
 if (-not $pythonLauncher) {
     throw 'Python was not found. Install Python 3.11 or newer and rerun this installer.'
