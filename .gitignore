@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Runtime data belongs in %LOCALAPPDATA%\MDOTStandardsMonitor, never Git.
+config.json
+state.json
+runtime.json
+monitor.lock
