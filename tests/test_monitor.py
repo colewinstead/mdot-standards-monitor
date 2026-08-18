@@ -107,6 +107,19 @@ class ComparisonTests(unittest.TestCase):
         self.assertFalse(changes["documents_added"])
         self.assertFalse(changes["documents_removed"])
 
+    def test_dynamic_document_url_change_is_relinked_not_removed(self):
+        old_document = document("https://pwdocs.example/old", "Training", "same")
+        old_document["identity"] = "dynamic:Training"
+        new_document = document("https://pwdocs.example/new", "Training", "same")
+        new_document["identity"] = "dynamic:Training"
+        changes = monitor.compare_snapshots(
+            snapshot(documents=[old_document]),
+            snapshot(documents=[new_document]),
+        )
+        self.assertEqual(1, len(changes["documents_relinked"]))
+        self.assertFalse(changes["documents_added"])
+        self.assertFalse(changes["documents_removed"])
+
     def test_page_and_link_changes(self):
         old = snapshot("Old", links=[{"url": "https://x/a", "title": "A"}])
         new = snapshot("New", links=[{"url": "https://x/a", "title": "Renamed"}, {"url": "https://x/b", "title": "B"}])
@@ -141,6 +154,30 @@ class DetailedComparisonTests(unittest.TestCase):
             self.assertTrue(any("Page 2 changed" in detail for detail in details))
             self.assertTrue(any("Original requirement" in detail for detail in details))
             self.assertTrue(any("Revised requirement" in detail for detail in details))
+
+    def test_dynamic_pdf_link_resolver_selects_only_matching_target(self):
+        import pymupdf
+
+        target = "https://pwdocs.mdot.state.ms.us/Resources/Services/ProjectWise/Download.ashx/View?key=new-key"
+        document_file = pymupdf.open()
+        page = document_file.new_page()
+        page.insert_link({
+            "kind": pymupdf.LINK_URI,
+            "from": pymupdf.Rect(10, 10, 200, 30),
+            "uri": target,
+        })
+        pdf_bytes = document_file.tobytes()
+        document_file.close()
+        rule = {
+            "title": "RWD Workflow Training ORD",
+            "source_url": "https://mdot.ms.gov/manual.pdf",
+            "match_host": "pwdocs.mdot.state.ms.us",
+            "match_path_contains": "/ProjectWise/Download.ashx/View",
+        }
+        with mock.patch("monitor.urlopen", return_value=io.BytesIO(pdf_bytes)):
+            resolved = monitor.resolve_dynamic_document(rule)
+        self.assertEqual(target, resolved["url"])
+        self.assertEqual("dynamic:RWD Workflow Training ORD", resolved["identity"])
 
     def test_word_paragraph_changes_are_described(self):
         details = monitor.describe_analysis_changes(

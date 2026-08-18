@@ -56,7 +56,7 @@ The configuration contains only the page URL and recipient addresses—never an 
 
 The monitor follows changes on the MDOT page and hashes directly linked files hosted by MDOT. It records the presence, title, and URL of third-party links but does not crawl or hash external websites.
 
-One ProjectWise-hosted PDF, `RWD Workflow Training ORD`, is explicitly included through the `extra_documents` configuration. The monitor does not follow any other links embedded inside PDFs.
+One ProjectWise-hosted PDF, `RWD Workflow Training ORD`, is dynamically resolved from the RWD CADD Manual on every run. The resolver accepts exactly one link matching the trusted ProjectWise host and download path, so a changed ProjectWise key is followed automatically while every other embedded link remains ignored. Multiple matching destinations cause a safe failure instead of an ambiguous selection.
 
 ## Tests
 

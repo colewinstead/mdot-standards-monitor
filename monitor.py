@@ -250,6 +250,7 @@ def download_document(item: dict[str, str], timeout_seconds: int = 180) -> dict[
                 "url": item["url"],
                 "title": item["title"],
                 "section": item["section"],
+                "identity": item.get("identity", item["url"]),
                 "sha256": digest.hexdigest(),
                 "size": size,
                 "content_type": response.headers.get_content_type(),
@@ -432,12 +433,56 @@ def analyze_document(
     }
 
 
+def resolve_dynamic_document(rule: dict[str, str], timeout_seconds: int = 60) -> dict[str, str]:
+    source_url = canonicalize_url(DEFAULT_URL, str(rule["source_url"]))
+    request = Request(source_url, headers={"User-Agent": USER_AGENT, "Accept": "application/pdf,*/*"})
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            content = response.read(25 * 1024 * 1024 + 1)
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise MonitorError(f"Could not download dynamic-link source {source_url}: {exc}") from exc
+    if len(content) > 25 * 1024 * 1024:
+        raise MonitorError(f"Dynamic-link source is unexpectedly larger than 25 MB: {source_url}")
+    try:
+        import pymupdf
+        with pymupdf.open(stream=content, filetype="pdf") as document:
+            links = {
+                canonicalize_url(source_url, str(link["uri"]))
+                for page in document
+                for link in page.get_links()
+                if link.get("uri")
+            }
+    except Exception as exc:
+        raise MonitorError(f"Could not extract links from dynamic-link source {source_url}: {exc}") from exc
+
+    match_host = str(rule["match_host"]).lower()
+    match_path = str(rule.get("match_path_contains", ""))
+    matches = sorted(
+        link
+        for link in links
+        if urlsplit(link).hostname == match_host
+        and (not match_path or match_path.lower() in urlsplit(link).path.lower())
+    )
+    if len(matches) != 1:
+        raise MonitorError(
+            f"Expected exactly one matching link in {source_url}, found {len(matches)}"
+        )
+    return {
+        "url": matches[0],
+        "title": normalize_text(str(rule["title"])),
+        "section": normalize_text(str(rule.get("section", "Dynamically monitored documents"))),
+        "identity": "dynamic:" + normalize_text(str(rule["title"])),
+        "source_url": source_url,
+    }
+
+
 def build_snapshot(
     page_url: str,
     logger: logging.Logger,
     previous_snapshot: dict[str, object] | None = None,
     force_analysis: bool = False,
     extra_documents: list[dict[str, str]] | None = None,
+    dynamic_documents: list[dict[str, str]] | None = None,
 ) -> dict[str, object]:
     rendered = render_page(page_url)
     page = parse_rendered_page(rendered, page_url)
@@ -454,8 +499,18 @@ def build_snapshot(
                 }
             )
             known_urls.add(extra_url)
-    logger.info("Rendered page with %d links and %d MDOT documents", len(page["links"]), len(document_links))
+    for rule in dynamic_documents or []:
+        resolved = resolve_dynamic_document(rule)
+        if resolved["url"] not in known_urls:
+            document_links.append(resolved)
+            known_urls.add(resolved["url"])
+            logger.info("Resolved dynamic document %s to %s", resolved["title"], resolved["url"])
+    logger.info("Rendered page with %d links and %d monitored documents", len(page["links"]), len(document_links))
     previous_documents = {
+        item.get("identity", item["url"]): item
+        for item in (previous_snapshot or {}).get("documents", [])
+    }
+    previous_by_url = {
         item["url"]: item for item in (previous_snapshot or {}).get("documents", [])
     }
     documents = []
@@ -464,7 +519,7 @@ def build_snapshot(
         downloaded = download_document(item)
         temp_path = Path(str(downloaded.pop("_temp_path")))
         try:
-            previous = previous_documents.get(item["url"])
+            previous = previous_documents.get(item.get("identity", item["url"])) or previous_by_url.get(item["url"])
             if (
                 not force_analysis
                 and previous
@@ -648,8 +703,8 @@ def describe_page_text_changes(old_text: str, new_text: str) -> list[str]:
 
 
 def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[str, object]:
-    old_docs = {item["url"]: item for item in old.get("documents", [])}
-    new_docs = {item["url"]: item for item in new.get("documents", [])}
+    old_docs = {item.get("identity", item["url"]): item for item in old.get("documents", [])}
+    new_docs = {item.get("identity", item["url"]): item for item in new.get("documents", [])}
     added_urls = set(new_docs) - set(old_docs)
     removed_urls = set(old_docs) - set(new_docs)
     moved: list[dict[str, object]] = []
@@ -677,6 +732,11 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
         for url in sorted(set(old_docs) & set(new_docs))
         if old_docs[url].get("title") != new_docs[url].get("title")
     ]
+    relinked = [
+        {"old": old_docs[key], "new": new_docs[key]}
+        for key in sorted(set(old_docs) & set(new_docs))
+        if old_docs[key].get("url") != new_docs[key].get("url")
+    ]
 
     def link_map(snapshot: dict[str, object]) -> dict[str, str]:
         return {item["url"]: item.get("title", "") for item in snapshot.get("links", [])}
@@ -699,6 +759,7 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
         "documents_removed": [old_docs[url] for url in sorted(removed_urls)],
         "documents_modified": modified,
         "documents_renamed": renamed,
+        "documents_relinked": relinked,
         "documents_moved": moved,
         "links_added": link_added,
         "links_removed": link_removed,
@@ -746,6 +807,7 @@ def format_change_email(changes: dict[str, object], snapshot: dict[str, object])
     doc_list("Documents removed", changes["documents_removed"], lambda x: e(str(x["title"])))
     doc_list("Document contents modified", changes["documents_modified"], modified_document)
     doc_list("Documents renamed", changes["documents_renamed"], lambda x: f'{e(str(x["old"]["title"]))} &rarr; <a href="{e(str(x["new"]["url"]))}">{e(str(x["new"]["title"]))}</a>')
+    doc_list("Document links changed", changes["documents_relinked"], lambda x: f'{e(str(x["old"]["url"]))} &rarr; <a href="{e(str(x["new"]["url"]))}">{e(str(x["new"]["title"]))}</a>')
     doc_list("Documents moved or replaced at a new URL", changes["documents_moved"], lambda x: f'{e(str(x["old"]["url"]))} &rarr; <a href="{e(str(x["new"]["url"]))}">{e(str(x["new"]["title"]))}</a>')
     doc_list("Links added", changes["links_added"], lambda x: f'<a href="{e(str(x["url"]))}">{e(str(x["title"]))}</a>')
     doc_list("Links removed", changes["links_removed"], lambda x: e(f'{x["title"]} ({x["url"]})'))
@@ -837,6 +899,7 @@ def load_config(require_recipients: bool = False) -> dict[str, object]:
     config.setdefault("recipients", [])
     config.setdefault("failure_recipient", "")
     config.setdefault("extra_documents", [])
+    config.setdefault("dynamic_documents", [])
     recipients = config["recipients"]
     if not isinstance(recipients, list):
         raise MonitorError(f"recipients must be a list in {CONFIG_FILE}")
@@ -849,6 +912,16 @@ def load_config(require_recipients: bool = False) -> dict[str, object]:
         for item in config["extra_documents"]
     ):
         raise MonitorError(f"extra_documents must be a list of objects with url and title in {CONFIG_FILE}")
+    if not isinstance(config["dynamic_documents"], list) or any(
+        not isinstance(item, dict)
+        or not item.get("source_url")
+        or not item.get("title")
+        or not item.get("match_host")
+        for item in config["dynamic_documents"]
+    ):
+        raise MonitorError(
+            f"dynamic_documents must include source_url, title, and match_host in {CONFIG_FILE}"
+        )
     return config
 
 
@@ -917,6 +990,7 @@ def run_check(args: argparse.Namespace) -> int:
                 previous_snapshot=baseline,
                 force_analysis=False,
                 extra_documents=list(config.get("extra_documents", [])),
+                dynamic_documents=list(config.get("dynamic_documents", [])),
             )
             if args.dry_run:
                 if baseline:
@@ -1015,6 +1089,7 @@ def send_change_preview() -> int:
                 "new": {"url": renamed_example["url"], "title": f'Example renamed document — {renamed_example["title"]}', "sha256": "example-updated"},
             }
         ],
+        "documents_relinked": [],
         "documents_moved": [],
         "links_added": [],
         "links_removed": [],

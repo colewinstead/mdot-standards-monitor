@@ -102,11 +102,14 @@ New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
     page_url = 'https://mdot.ms.gov/portal/engineering_standards_guides_manuals'
     recipients = $recipientAddresses
     failure_recipient = $FailureRecipient
-    extra_documents = @(
+    extra_documents = @()
+    dynamic_documents = @(
         @{
             title = 'RWD Workflow Training ORD'
-            url = 'https://pwdocs.mdot.state.ms.us/Resources/Services/ProjectWise/Download.ashx/View?connectionId=default&key=ECObjects%7CBentley_DMS%7CDMSDocument%7C28599_4&view=inline&provider=Bentley.ECOM.ProjectWiseProvider&location=PWINTG.MDOT.STATE.MS.US%3AMDOT'
-            section = 'Explicitly monitored documents'
+            source_url = 'https://mdot.ms.gov/documents/Roadway%20Design/Manuals/CADD/RWD%20Cadd%20Manual.pdf'
+            match_host = 'pwdocs.mdot.state.ms.us'
+            match_path_contains = '/Resources/Services/ProjectWise/Download.ashx/View'
+            section = 'Dynamically monitored documents'
         }
     )
 } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $configFile -Encoding UTF8
