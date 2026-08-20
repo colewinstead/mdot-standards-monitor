@@ -119,6 +119,79 @@ The monitor follows changes on the MDOT page and hashes directly linked files ho
 
 One ProjectWise-hosted PDF, `RWD Workflow Training ORD`, is dynamically resolved from the RWD CADD Manual on every run. The resolver accepts exactly one link matching the trusted ProjectWise host and download path, so a changed ProjectWise key is followed automatically while every other embedded link remains ignored. Multiple matching destinations cause a safe failure instead of an ambiguous selection.
 
+## ProjectWise Explorer folder monitoring (planned)
+
+This feature is **not implemented yet**. The existing ProjectWise resolver above follows one public
+download link; it cannot sign in to a private ProjectWise datasource or enumerate a ProjectWise
+Explorer folder.
+
+The intended feature is read-only monitoring of one or more ProjectWise Explorer folders. It should
+use the signed-in employee's approved Windows/ProjectWise SSO session and recursively inventory the
+configured folders. For each visible document, retain enough information to detect additions,
+removals, renames, new versions, metadata changes, and file-content changes. Feed confirmed changes
+through the existing email formatting, recipient routing, history dashboard, retry, and failure-alert
+systems. Creating the first ProjectWise baseline must not send a change alert.
+
+Do not monitor ProjectWise's local `pwworkdir` cache. That directory contains only documents copied
+to the computer and can therefore miss new or untouched documents in the datasource. Do not store a
+ProjectWise username, password, access token, or other secret in this repository or in `config.json`.
+The integration must not check out, check in, upload, rename, move, delete, or change the workflow
+state of any ProjectWise document.
+
+### Work-computer discovery checklist
+
+Perform these read-only checks on the work computer before changing the program:
+
+1. Pull this repository with `git pull --ff-only` and run the existing unit tests.
+2. Record the installed ProjectWise Explorer version, Python version, PowerShell version, datasource
+   display name, and target folder path as shown in ProjectWise Explorer.
+3. Determine whether an organization-approved ProjectWise SDK, API, or PowerShell module is already
+   installed. In PowerShell, `Get-Module -ListAvailable pwps_dab` is a harmless initial check. Do not
+   install a module or request elevated rights without confirming company policy.
+4. Determine whether the user's normal SSO session can perform a read-only folder/document query.
+   Never pass a password on a command line. ProjectWise Explorer's `pwc.exe` arguments can open a
+   datasource or select a folder, but that alone is not proof that folder contents can be enumerated.
+5. Confirm that the query works while connected through the network or VPN conditions under which
+   the Windows scheduled task will run.
+
+### Implementation requirements
+
+- Add a separate `projectwise_sources` configuration collection. Each source should have a friendly
+  name, datasource identifier, ProjectWise folder path or stable folder ID, recursive flag, and
+  optional title/extension filters.
+- Add configuration commands equivalent to `config add-projectwise-folder`,
+  `config remove-projectwise-folder`, and `config list-projectwise-folders`. Final arguments should
+  be based on what the installed ProjectWise tooling actually supports; the command names are
+  proposals, not currently available commands.
+- Keep the MDOT website baseline and every ProjectWise source baseline independent so adding or
+  repairing a ProjectWise source cannot reset MDOT history.
+- Prefer stable ProjectWise document and folder IDs over display paths when available. Preserve the
+  display path in reports so people can understand where a change occurred.
+- Use read-only metadata first. Download or copy out a file only when a content hash or detailed
+  comparison is required, place temporary copies under the monitor's local application-data folder,
+  and clean them safely after use.
+- Re-query the ProjectWise source during change confirmation. If a source is unavailable, preserve
+  its last good baseline and notify only the configured failure recipient rather than reporting all
+  documents as removed.
+- Support `check --dry-run`, `status`, history reports, global filters, and recipient routes for
+  ProjectWise changes without changing their current MDOT behavior.
+- Add mocked unit tests that run without ProjectWise, plus an explicit read-only integration-test
+  command for the work computer. The integration test must never send email or modify the baseline.
+- Verify Task Scheduler execution under the same Windows user and SSO context. If ProjectWise access
+  requires an interactive logged-on session, retain the installer's current logged-on-user task
+  behavior and document that limitation.
+
+### Prompt for tomorrow's Codex session
+
+After opening this repository in Codex on the work computer, use this prompt:
+
+> Continue the planned ProjectWise Explorer folder-monitoring work described in README.md. First run
+> only the read-only discovery checklist and inspect the installed ProjectWise tooling. Do not install
+> software, request elevation, store credentials, or perform any ProjectWise write operation. Report
+> what datasource-query method is available and propose the exact configuration shape and integration
+> test. If a safe read-only query works, implement the adapter with mocked tests and a no-email,
+> no-baseline-write integration test. Preserve all existing MDOT monitoring behavior.
+
 ## Tests
 
 ```powershell
