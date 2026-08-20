@@ -102,6 +102,17 @@ New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
     page_url = 'https://mdot.ms.gov/portal/engineering_standards_guides_manuals'
     recipients = $recipientAddresses
     failure_recipient = $FailureRecipient
+    filters = @{
+        sections = @()
+        titles = @()
+        extensions = @()
+    }
+    recipient_rules = @()
+    retry_attempts = 3
+    retry_delay_seconds = 5
+    confirmation_delay_seconds = 120
+    heartbeat_days = 7
+    history_limit = 100
     extra_documents = @()
     dynamic_documents = @(
         @{

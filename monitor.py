@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import copy
 import difflib
 import hashlib
 import html as html_module
@@ -41,10 +43,21 @@ BASE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"
 CONFIG_FILE = BASE_DIR / "config.json"
 STATE_FILE = BASE_DIR / "state.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
+HISTORY_FILE = BASE_DIR / "history.json"
+HISTORY_DASHBOARD = BASE_DIR / "history.html"
+HISTORY_REPORTS_DIR = BASE_DIR / "history_reports"
+PREVIEW_DIR = BASE_DIR / "page_previews"
 LOCK_FILE = BASE_DIR / "monitor.lock"
 LOG_FILE = BASE_DIR / "monitor.log"
 SCRIPT_DIR = Path(__file__).resolve().parent
 EMAIL_HELPER = SCRIPT_DIR / "send_outlook.ps1"
+TASK_NAME = "MDOT Standards Daily Monitor"
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_DELAY_SECONDS = 5
+DEFAULT_CONFIRMATION_DELAY_SECONDS = 120
+DEFAULT_HEARTBEAT_DAYS = 7
+DEFAULT_HISTORY_LIMIT = 100
+MAX_PDF_PREVIEW_PAIRS = 3
 
 
 class MonitorError(RuntimeError):
@@ -122,6 +135,21 @@ class MainContentParser(HTMLParser):
 
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("\u200c", " ").replace("\xa0", " ")).strip()
+
+
+def retry_operation(operation, attempts: int, delay_seconds: float, logger: logging.Logger, label: str):
+    """Retry a complete network/render operation without hiding the final error."""
+    attempts = max(1, int(attempts))
+    delay_seconds = max(0.0, float(delay_seconds))
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception:
+            if attempt >= attempts:
+                raise
+            wait = delay_seconds * (2 ** (attempt - 1))
+            logger.warning("%s failed on attempt %d/%d; retrying in %.1f seconds", label, attempt, attempts, wait)
+            time.sleep(wait)
 
 
 def canonicalize_url(base_url: str, value: str) -> str:
@@ -269,7 +297,7 @@ def normalized_lines(value: str) -> list[str]:
     return [normalize_text(line) for line in value.splitlines() if normalize_text(line)]
 
 
-def analyze_pdf(path: Path) -> dict[str, object]:
+def analyze_pdf(path: Path, preview_directory: Path | None = None) -> dict[str, object]:
     try:
         import pymupdf
     except ImportError as exc:
@@ -277,20 +305,25 @@ def analyze_pdf(path: Path) -> dict[str, object]:
 
     pages: list[dict[str, object]] = []
     try:
+        if preview_directory is not None:
+            preview_directory.mkdir(parents=True, exist_ok=True)
         with pymupdf.open(path, filetype="pdf") as document:
             for index, page in enumerate(document):
                 text = "\n".join(normalized_lines(page.get_text("text", sort=True)))
                 # A low-resolution grayscale rendering catches drawings and scanned pages
                 # that contain little or no extractable text.
                 pixmap = page.get_pixmap(dpi=48, colorspace=pymupdf.csGRAY, alpha=False, annots=True)
-                pages.append(
-                    {
-                        "page": index + 1,
-                        "text": text,
-                        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                        "visual_sha256": hashlib.sha256(pixmap.samples).hexdigest(),
-                    }
-                )
+                page_snapshot = {
+                    "page": index + 1,
+                    "text": text,
+                    "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "visual_sha256": hashlib.sha256(pixmap.samples).hexdigest(),
+                }
+                if preview_directory is not None:
+                    preview_path = preview_directory / f"page-{index + 1:04d}.png"
+                    pixmap.save(preview_path)
+                    page_snapshot["preview_path"] = str(preview_path)
+                pages.append(page_snapshot)
     except Exception as exc:
         raise MonitorError(f"Could not analyze PDF {path.name}: {exc}") from exc
     return {"kind": "pdf_pages", "pages": pages}
@@ -417,10 +450,11 @@ def analyze_document(
     url: str,
     content_type: str = "",
     content_disposition: str = "",
+    preview_directory: Path | None = None,
 ) -> dict[str, object]:
     extension = infer_document_extension(url, content_type, content_disposition)
     if extension == ".pdf":
-        return analyze_pdf(path)
+        return analyze_pdf(path, preview_directory)
     if extension in {".docx", ".docm"}:
         return analyze_word(path)
     if extension in {".xlsx", ".xlsm"}:
@@ -476,6 +510,46 @@ def resolve_dynamic_document(rule: dict[str, str], timeout_seconds: int = 60) ->
     }
 
 
+def normalize_filters(filters: dict[str, object] | None) -> dict[str, list[str]]:
+    source = filters or {}
+    return {
+        "sections": [normalize_text(str(value)) for value in source.get("sections", []) if normalize_text(str(value))],
+        "titles": [normalize_text(str(value)) for value in source.get("titles", []) if normalize_text(str(value))],
+        "extensions": [
+            ("." + str(value).lstrip(".")).lower()
+            for value in source.get("extensions", [])
+            if str(value).strip()
+        ],
+    }
+
+
+def item_matches_filters(item: dict[str, object], filters: dict[str, object] | None) -> bool:
+    normalized = normalize_filters(filters)
+    section = str(item.get("section", "")).casefold()
+    title = str(item.get("title", item.get("new_title", ""))).casefold()
+    path = unquote(urlsplit(str(item.get("url", ""))).path)
+    extension = Path(path).suffix.lower()
+    if normalized["sections"] and not any(value.casefold() in section for value in normalized["sections"]):
+        return False
+    if normalized["titles"] and not any(value.casefold() in title for value in normalized["titles"]):
+        return False
+    if normalized["extensions"] and extension not in normalized["extensions"]:
+        return False
+    return True
+
+
+def analysis_can_be_reused(analysis: dict[str, object], store_previews: bool) -> bool:
+    if not analysis:
+        return False
+    if not store_previews or analysis.get("kind") != "pdf_pages":
+        return True
+    pages = list(analysis.get("pages", []))
+    return bool(pages) and all(
+        page.get("preview_path") and Path(str(page["preview_path"])).is_file()
+        for page in pages
+    )
+
+
 def build_snapshot(
     page_url: str,
     logger: logging.Logger,
@@ -483,6 +557,9 @@ def build_snapshot(
     force_analysis: bool = False,
     extra_documents: list[dict[str, str]] | None = None,
     dynamic_documents: list[dict[str, str]] | None = None,
+    filters: dict[str, object] | None = None,
+    store_previews: bool = True,
+    preview_root: Path | None = None,
 ) -> dict[str, object]:
     rendered = render_page(page_url)
     page = parse_rendered_page(rendered, page_url)
@@ -505,6 +582,11 @@ def build_snapshot(
             document_links.append(resolved)
             known_urls.add(resolved["url"])
             logger.info("Resolved dynamic document %s to %s", resolved["title"], resolved["url"])
+    document_links = [item for item in document_links if item_matches_filters(item, filters)]
+    filtered_page_links = [
+        item for item in page["links"]
+        if item_matches_filters(item, {"sections": normalize_filters(filters)["sections"], "titles": normalize_filters(filters)["titles"]})
+    ]
     logger.info("Rendered page with %d links and %d monitored documents", len(page["links"]), len(document_links))
     previous_documents = {
         item.get("identity", item["url"]): item
@@ -524,7 +606,7 @@ def build_snapshot(
                 not force_analysis
                 and previous
                 and previous.get("sha256") == downloaded["sha256"]
-                and previous.get("analysis")
+                and analysis_can_be_reused(previous.get("analysis") or {}, store_previews)
             ):
                 downloaded["analysis"] = previous["analysis"]
             else:
@@ -534,6 +616,7 @@ def build_snapshot(
                     item["url"],
                     str(downloaded.get("content_type", "")),
                     str(downloaded.get("content_disposition", "")),
+                    (preview_root or PREVIEW_DIR) / str(downloaded["sha256"]) if store_previews else None,
                 )
             documents.append(downloaded)
         finally:
@@ -544,7 +627,7 @@ def build_snapshot(
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "page_url": page_url,
         "page_text": page["text"],
-        "links": page["links"],
+        "links": filtered_page_links,
         "documents": documents,
     }
 
@@ -612,6 +695,36 @@ def describe_pdf_changes(old: dict[str, object], new: dict[str, object]) -> list
     if not details:
         details.append("File packaging or metadata changed; no rendered page difference was found")
     return details[:20] + ([f"{len(details) - 20} additional page change(s) omitted"] if len(details) > 20 else [])
+
+
+def pdf_preview_pairs(old: dict[str, object], new: dict[str, object]) -> list[dict[str, object]]:
+    if old.get("kind") != "pdf_pages" or new.get("kind") != "pdf_pages":
+        return []
+    old_pages = list(old.get("pages", []))
+    new_pages = list(new.get("pages", []))
+    old_signatures = [page.get("visual_sha256") or page.get("text_sha256") for page in old_pages]
+    new_signatures = [page.get("visual_sha256") or page.get("text_sha256") for page in new_pages]
+    matcher = difflib.SequenceMatcher(a=old_signatures, b=new_signatures, autojunk=False)
+    previews: list[dict[str, object]] = []
+    for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if operation == "equal":
+            continue
+        paired = min(old_end - old_start, new_end - new_start)
+        for offset in range(paired):
+            old_page = old_pages[old_start + offset]
+            new_page = new_pages[new_start + offset]
+            old_path = str(old_page.get("preview_path", ""))
+            new_path = str(new_page.get("preview_path", ""))
+            if old_path and new_path and Path(old_path).is_file() and Path(new_path).is_file():
+                previews.append({
+                    "old_page": int(old_page["page"]),
+                    "new_page": int(new_page["page"]),
+                    "old_path": old_path,
+                    "new_path": new_path,
+                })
+            if len(previews) >= MAX_PDF_PREVIEW_PAIRS:
+                return previews
+    return previews
 
 
 def describe_sequence_changes(
@@ -723,6 +836,10 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
             "old": old_docs[url],
             "new": new_docs[url],
             "details": describe_analysis_changes(old_docs[url], new_docs[url]),
+            "previews": pdf_preview_pairs(
+                old_docs[url].get("analysis") or {},
+                new_docs[url].get("analysis") or {},
+            ),
         }
         for url in sorted(set(old_docs) & set(new_docs))
         if old_docs[url].get("sha256") != new_docs[url].get("sha256")
@@ -738,16 +855,21 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
         if old_docs[key].get("url") != new_docs[key].get("url")
     ]
 
-    def link_map(snapshot: dict[str, object]) -> dict[str, str]:
-        return {item["url"]: item.get("title", "") for item in snapshot.get("links", [])}
+    def link_map(snapshot: dict[str, object]) -> dict[str, dict[str, object]]:
+        return {item["url"]: item for item in snapshot.get("links", [])}
 
     old_links, new_links = link_map(old), link_map(new)
-    link_added = [{"url": url, "title": new_links[url]} for url in sorted(set(new_links) - set(old_links))]
-    link_removed = [{"url": url, "title": old_links[url]} for url in sorted(set(old_links) - set(new_links))]
+    link_added = [new_links[url] for url in sorted(set(new_links) - set(old_links))]
+    link_removed = [old_links[url] for url in sorted(set(old_links) - set(new_links))]
     link_renamed = [
-        {"url": url, "old_title": old_links[url], "new_title": new_links[url]}
+        {
+            "url": url,
+            "old_title": old_links[url].get("title", ""),
+            "new_title": new_links[url].get("title", ""),
+            "section": new_links[url].get("section", old_links[url].get("section", "")),
+        }
         for url in sorted(set(old_links) & set(new_links))
-        if old_links[url] != new_links[url]
+        if old_links[url].get("title", "") != new_links[url].get("title", "")
     ]
     return {
         "page_text_changed": old.get("page_text") != new.get("page_text"),
@@ -786,7 +908,83 @@ def change_count(changes: dict[str, object]) -> int:
     )
 
 
-def format_change_email(changes: dict[str, object], snapshot: dict[str, object]) -> str:
+def change_subject(item: dict[str, object]) -> dict[str, object]:
+    for key in ("new", "old"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            return value
+    return item
+
+
+def filter_changes(changes: dict[str, object], filters: dict[str, object], include_page_text: bool = False) -> dict[str, object]:
+    filtered: dict[str, object] = {
+        "page_text_changed": bool(changes.get("page_text_changed")) and include_page_text,
+        "page_text_details": list(changes.get("page_text_details", [])) if include_page_text else [],
+    }
+    for key, value in changes.items():
+        if key in {"page_text_changed", "page_text_details"}:
+            continue
+        filtered[key] = [item for item in value if item_matches_filters(change_subject(item), filters)]
+    return filtered
+
+
+def notification_batches(
+    changes: dict[str, object],
+    config: dict[str, object],
+) -> list[tuple[list[str], dict[str, object], str]]:
+    batches: list[tuple[list[str], dict[str, object], str]] = []
+    global_recipients = list(dict.fromkeys(str(value) for value in config.get("recipients", []) if str(value)))
+    if global_recipients:
+        batches.append((global_recipients, changes, "All monitored changes"))
+    for rule in config.get("recipient_rules", []):
+        recipients = [
+            str(value) for value in rule.get("recipients", [])
+            if str(value) and str(value) not in global_recipients
+        ]
+        routed = filter_changes(
+            changes,
+            rule.get("filters", {}),
+            include_page_text=bool(rule.get("include_page_text", False)),
+        )
+        if recipients and has_changes(routed):
+            batches.append((list(dict.fromkeys(recipients)), routed, str(rule["name"])))
+    return batches
+
+
+def preview_content_id(path: str) -> str:
+    return "mdot-preview-" + hashlib.sha256(path.encode("utf-8")).hexdigest()[:20]
+
+
+def preview_image_source(path: str, image_mode: str) -> str:
+    if path.startswith("data:image/"):
+        return path
+    if image_mode == "data":
+        try:
+            encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+            return "data:image/png;base64," + encoded
+        except OSError:
+            return ""
+    return "cid:" + preview_content_id(path)
+
+
+def inline_images_for_changes(changes: dict[str, object]) -> list[dict[str, str]]:
+    images: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in changes.get("documents_modified", []):
+        for preview in item.get("previews", []):
+            for key in ("old_path", "new_path"):
+                path = str(preview.get(key, ""))
+                if path and path not in seen and Path(path).is_file():
+                    seen.add(path)
+                    images.append({"path": path, "content_id": preview_content_id(path)})
+    return images
+
+
+def format_change_email(
+    changes: dict[str, object],
+    snapshot: dict[str, object],
+    image_mode: str = "cid",
+) -> str:
     e = html_module.escape
     sections: list[str] = []
     link_style = (
@@ -844,7 +1042,30 @@ def format_change_email(changes: dict[str, object], snapshot: dict[str, object])
                 )
                 + "</table>"
             )
-        return f'{link(new_document["url"], new_document["title"])}{detail_html}'
+        preview_html = ""
+        preview_rows = []
+        for preview in item.get("previews", []):
+            old_source = preview_image_source(str(preview.get("old_path", "")), image_mode)
+            new_source = preview_image_source(str(preview.get("new_path", "")), image_mode)
+            if not old_source or not new_source:
+                continue
+            old_page = int(preview["old_page"])
+            new_page = int(preview["new_page"])
+            preview_rows.append(
+                '<tr><td width="50%" valign="top" style="padding:10px 5px 4px 0;">'
+                f'<div style="padding-bottom:5px;font-size:11px;line-height:16px;font-weight:700;color:#687985;">BEFORE — PAGE {old_page}</div>'
+                f'<img src="{e(old_source)}" alt="Before page {old_page}" width="280" style="display:block;width:100%;max-width:280px;height:auto;border:1px solid #cbd6dc;">'
+                '</td><td width="50%" valign="top" style="padding:10px 0 4px 5px;">'
+                f'<div style="padding-bottom:5px;font-size:11px;line-height:16px;font-weight:700;color:#687985;">AFTER — PAGE {new_page}</div>'
+                f'<img src="{e(new_source)}" alt="After page {new_page}" width="280" style="display:block;width:100%;max-width:280px;height:auto;border:1px solid #cbd6dc;">'
+                '</td></tr>'
+            )
+        if preview_rows:
+            preview_html = (
+                '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+                'style="margin-top:8px;">' + "".join(preview_rows) + "</table>"
+            )
+        return f'{link(new_document["url"], new_document["title"])}{detail_html}{preview_html}'
 
     add_section("Documents added", changes["documents_added"], lambda x: link(x["url"], x["title"]))
     add_section("Documents removed", changes["documents_removed"], lambda x: e(str(x["title"])))
@@ -991,6 +1212,107 @@ def atomic_write_json(path: Path, value: object) -> None:
     os.replace(temp_path, path)
 
 
+def summarize_changes(changes: dict[str, object]) -> list[str]:
+    lines: list[str] = []
+    if changes.get("page_text_changed"):
+        lines.append("Visible page content changed")
+    labels = (
+        ("documents_added", "document(s) added"),
+        ("documents_removed", "document(s) removed"),
+        ("documents_modified", "document(s) modified"),
+        ("documents_renamed", "document(s) renamed"),
+        ("documents_relinked", "document link(s) changed"),
+        ("documents_moved", "document(s) moved"),
+        ("links_added", "page link(s) added"),
+        ("links_removed", "page link(s) removed"),
+        ("links_renamed", "page link title(s) changed"),
+    )
+    for key, label in labels:
+        count = len(changes.get(key, []))
+        if count:
+            lines.append(f"{count} {label}")
+    return lines
+
+
+def write_history_dashboard(events: list[dict[str, object]]) -> None:
+    e = html_module.escape
+    rows = []
+    colors = {"change": "#d97706", "heartbeat": "#2f855a", "failure": "#b42318", "suppressed": "#687985"}
+    for event in events:
+        kind = str(event.get("kind", "event"))
+        report = str(event.get("report", ""))
+        report_link = ""
+        if report and Path(report).is_file():
+            report_link = f'<a href="{e(Path(report).resolve().as_uri())}" style="color:#176b87;font-weight:700;">View report</a>'
+        details = "<br>".join(e(str(value)) for value in event.get("details", []))
+        rows.append(
+            '<tr><td style="padding:14px;border-bottom:1px solid #d7e0e5;vertical-align:top;white-space:nowrap;">'
+            f'<span style="display:inline-block;padding:4px 8px;background:{colors.get(kind, "#526675")};color:white;'
+            f'font-size:11px;font-weight:700;text-transform:uppercase;">{e(kind)}</span></td>'
+            '<td style="padding:14px;border-bottom:1px solid #d7e0e5;vertical-align:top;">'
+            f'<strong>{e(str(event.get("title", "Monitor event")))}</strong><br>'
+            f'<span style="color:#687985;font-size:12px;">{e(str(event.get("timestamp", "")))}</span>'
+            f'<div style="padding-top:6px;line-height:20px;">{details}</div></td>'
+            f'<td style="padding:14px;border-bottom:1px solid #d7e0e5;vertical-align:top;white-space:nowrap;">{report_link}</td></tr>'
+        )
+    body = "".join(rows) or '<tr><td style="padding:24px;">No monitor history has been recorded yet.</td></tr>'
+    html = (
+        '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>MDOT Standards Monitor History</title></head><body style="margin:0;background:#eaf0f3;font-family:Segoe UI,Arial,sans-serif;color:#253746;">'
+        '<div style="max-width:980px;margin:24px auto;background:white;border:1px solid #ced9df;">'
+        '<div style="height:6px;background:#d97706;"></div><div style="padding:24px 28px;background:#12324a;color:white;">'
+        '<div style="font-size:12px;font-weight:700;letter-spacing:1px;color:#9fd3e3;">MDOT STANDARDS MONITOR</div>'
+        '<h1 style="margin:6px 0 0;font-size:26px;">Change history</h1></div>'
+        '<div style="padding:18px 28px;color:#526675;">Newest events appear first. Reports and previews remain on this computer.</div>'
+        '<table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">'
+        f'{body}</table></div></body></html>'
+    )
+    HISTORY_DASHBOARD.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY_DASHBOARD.write_text(html, encoding="utf-8")
+
+
+def record_history(
+    kind: str,
+    title: str,
+    details: list[str],
+    limit: int = DEFAULT_HISTORY_LIMIT,
+    changes: dict[str, object] | None = None,
+    snapshot: dict[str, object] | None = None,
+) -> dict[str, object]:
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    event: dict[str, object] = {"timestamp": timestamp, "kind": kind, "title": title, "details": details}
+    if changes is not None and snapshot is not None:
+        HISTORY_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        report_name = re.sub(r"[^0-9A-Za-z_-]", "-", timestamp) + ".html"
+        report_path = HISTORY_REPORTS_DIR / report_name
+        report_path.write_text(format_change_email(changes, snapshot, image_mode="data"), encoding="utf-8")
+        event["report"] = str(report_path)
+        event["change_count"] = change_count(changes)
+    events = read_json(HISTORY_FILE, []) or []
+    if not isinstance(events, list):
+        events = []
+    events.insert(0, event)
+    keep = max(1, int(limit))
+    removed = events[keep:]
+    events = events[:keep]
+    for old_event in removed:
+        old_report = str(old_event.get("report", "")) if isinstance(old_event, dict) else ""
+        if old_report:
+            Path(old_report).unlink(missing_ok=True)
+    atomic_write_json(HISTORY_FILE, events)
+    write_history_dashboard(events)
+    return event
+
+
+def cleanup_preview_cache(snapshot: dict[str, object]) -> None:
+    if not PREVIEW_DIR.is_dir():
+        return
+    keep = {str(item.get("sha256", "")) for item in snapshot.get("documents", [])}
+    for directory in PREVIEW_DIR.iterdir():
+        if directory.is_dir() and re.fullmatch(r"[0-9a-f]{64}", directory.name) and directory.name not in keep:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
 class FileLock:
     def __enter__(self):
         BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1015,6 +1337,13 @@ def load_config(require_recipients: bool = False) -> dict[str, object]:
     config.setdefault("failure_recipient", "")
     config.setdefault("extra_documents", [])
     config.setdefault("dynamic_documents", [])
+    config.setdefault("filters", {"sections": [], "titles": [], "extensions": []})
+    config.setdefault("recipient_rules", [])
+    config.setdefault("retry_attempts", DEFAULT_RETRY_ATTEMPTS)
+    config.setdefault("retry_delay_seconds", DEFAULT_RETRY_DELAY_SECONDS)
+    config.setdefault("confirmation_delay_seconds", DEFAULT_CONFIRMATION_DELAY_SECONDS)
+    config.setdefault("heartbeat_days", DEFAULT_HEARTBEAT_DAYS)
+    config.setdefault("history_limit", DEFAULT_HISTORY_LIMIT)
     recipients = config["recipients"]
     if not isinstance(recipients, list):
         raise MonitorError(f"recipients must be a list in {CONFIG_FILE}")
@@ -1037,35 +1366,82 @@ def load_config(require_recipients: bool = False) -> dict[str, object]:
         raise MonitorError(
             f"dynamic_documents must include source_url, title, and match_host in {CONFIG_FILE}"
         )
+    if not isinstance(config["filters"], dict) or any(
+        not isinstance(config["filters"].get(key, []), list)
+        for key in ("sections", "titles", "extensions")
+    ):
+        raise MonitorError(f"filters must contain list values for sections, titles, and extensions in {CONFIG_FILE}")
+    if not isinstance(config["recipient_rules"], list) or any(
+        not isinstance(rule, dict)
+        or not rule.get("name")
+        or not isinstance(rule.get("recipients", []), list)
+        or not isinstance(rule.get("filters", {}), dict)
+        for rule in config["recipient_rules"]
+    ):
+        raise MonitorError(f"recipient_rules must contain name, recipients, and filters in {CONFIG_FILE}")
+    for key in ("retry_attempts", "retry_delay_seconds", "confirmation_delay_seconds", "heartbeat_days", "history_limit"):
+        if not isinstance(config[key], (int, float)) or config[key] < 0:
+            raise MonitorError(f"{key} must be a non-negative number in {CONFIG_FILE}")
     return config
 
 
-def send_outlook(subject: str, body_html: str, recipients: list[str]) -> None:
+def send_outlook(
+    subject: str,
+    body_html: str,
+    recipients: list[str],
+    inline_images: list[dict[str, str]] | None = None,
+) -> None:
     if not EMAIL_HELPER.exists():
         raise MonitorError(f"Outlook helper is missing: {EMAIL_HELPER}")
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".html", delete=False) as body_file:
         body_file.write(body_html)
         body_path = Path(body_file.name)
+    image_manifest_path: Path | None = None
     try:
         command = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", str(EMAIL_HELPER), "-Recipients", ";".join(recipients),
             "-Subject", subject, "-HtmlBodyFile", str(body_path),
         ]
+        if inline_images:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as manifest:
+                json.dump(inline_images, manifest, ensure_ascii=False)
+                image_manifest_path = Path(manifest.name)
+            command.extend(["-InlineImagesJsonFile", str(image_manifest_path)])
         result = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
         if result.returncode != 0:
             detail = normalize_text(result.stderr or result.stdout)
             raise MonitorError(f"Outlook could not send the email: {detail}")
     finally:
         body_path.unlink(missing_ok=True)
+        if image_manifest_path is not None:
+            image_manifest_path.unlink(missing_ok=True)
 
 
 def default_runtime() -> dict[str, object]:
-    return {"consecutive_failures": 0, "last_error": ""}
+    return {
+        "consecutive_failures": 0,
+        "last_error": "",
+        "last_attempt_at": "",
+        "last_success_at": "",
+        "last_change_at": "",
+        "last_notification_at": "",
+        "last_heartbeat_at": "",
+        "last_document_count": 0,
+        "last_change_count": 0,
+        "last_duration_seconds": 0.0,
+    }
+
+
+def load_runtime() -> dict[str, object]:
+    runtime = read_json(RUNTIME_FILE, {}) or {}
+    defaults = default_runtime()
+    defaults.update(runtime)
+    return defaults
 
 
 def record_failure(error: Exception, config: dict[str, object], logger: logging.Logger) -> None:
-    runtime = read_json(RUNTIME_FILE, default_runtime()) or default_runtime()
+    runtime = load_runtime()
     runtime["consecutive_failures"] = int(runtime.get("consecutive_failures", 0)) + 1
     runtime["last_error"] = str(error)
     failure_recipient = str(config.get("failure_recipient", "")).strip()
@@ -1090,22 +1466,71 @@ def record_failure(error: Exception, config: dict[str, object], logger: logging.
 
 
 def clear_failure_state(config: dict[str, object], logger: logging.Logger) -> None:
-    atomic_write_json(RUNTIME_FILE, default_runtime())
+    runtime = load_runtime()
+    runtime["consecutive_failures"] = 0
+    runtime["last_error"] = ""
+    atomic_write_json(RUNTIME_FILE, runtime)
+
+
+def heartbeat_is_due(runtime: dict[str, object], heartbeat_days: float) -> bool:
+    if heartbeat_days <= 0:
+        return False
+    value = str(runtime.get("last_heartbeat_at", ""))
+    if not value:
+        return True
+    try:
+        last = datetime.fromisoformat(value)
+    except ValueError:
+        return True
+    return (datetime.now().astimezone() - last).total_seconds() >= heartbeat_days * 86400
+
+
+def save_success_runtime(
+    runtime: dict[str, object],
+    snapshot: dict[str, object],
+    started: float,
+    changes: int = 0,
+) -> None:
+    runtime.update({
+        "consecutive_failures": 0,
+        "last_error": "",
+        "last_success_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "last_document_count": len(snapshot.get("documents", [])),
+        "last_change_count": changes,
+        "last_duration_seconds": round(time.monotonic() - started, 2),
+    })
+    atomic_write_json(RUNTIME_FILE, runtime)
 
 
 def run_check(args: argparse.Namespace) -> int:
     logger = setup_logging()
     config = load_config(require_recipients=False)
+    started = time.monotonic()
+    runtime = load_runtime()
+    if not args.dry_run:
+        runtime["last_attempt_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        atomic_write_json(RUNTIME_FILE, runtime)
     with FileLock():
         try:
             baseline = read_json(STATE_FILE)
-            snapshot = build_snapshot(
-                str(config["page_url"]),
+            def create_snapshot():
+                return build_snapshot(
+                    str(config["page_url"]),
+                    logger,
+                    previous_snapshot=baseline,
+                    force_analysis=False,
+                    extra_documents=list(config.get("extra_documents", [])),
+                    dynamic_documents=list(config.get("dynamic_documents", [])),
+                    filters=dict(config.get("filters", {})),
+                    store_previews=not args.dry_run,
+                )
+
+            snapshot = retry_operation(
+                create_snapshot,
+                int(config["retry_attempts"]),
+                float(config["retry_delay_seconds"]),
                 logger,
-                previous_snapshot=baseline,
-                force_analysis=False,
-                extra_documents=list(config.get("extra_documents", [])),
-                dynamic_documents=list(config.get("dynamic_documents", [])),
+                "MDOT snapshot",
             )
             if args.dry_run:
                 if baseline:
@@ -1118,29 +1543,353 @@ def run_check(args: argparse.Namespace) -> int:
 
             if args.initialize or baseline is None:
                 atomic_write_json(STATE_FILE, snapshot)
-                clear_failure_state(config, logger)
+                save_success_runtime(runtime, snapshot, started)
+                cleanup_preview_cache(snapshot)
                 logger.info("Baseline initialized with %d documents; no update email sent", len(snapshot["documents"]))
                 return 0
 
             changes = compare_snapshots(baseline, snapshot)
             if not has_changes(changes):
                 atomic_write_json(STATE_FILE, snapshot)
-                clear_failure_state(config, logger)
+                if (
+                    float(config["heartbeat_days"]) > 0
+                    and not runtime.get("last_heartbeat_at")
+                    and not runtime.get("last_success_at")
+                ):
+                    # Start the weekly interval without surprising an upgraded installation
+                    # with an immediate health email on its first successful run.
+                    runtime["last_heartbeat_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+                elif heartbeat_is_due(runtime, float(config["heartbeat_days"])):
+                    heartbeat_recipient = str(config.get("failure_recipient", "")).strip()
+                    if heartbeat_recipient:
+                        send_outlook(
+                            "[MDOT Standards] Weekly monitor health summary",
+                            format_status_email(
+                                "MDOT standards monitor is operating normally",
+                                f"The latest check completed successfully. The baseline currently contains {len(snapshot['documents'])} monitored documents, and no new MDOT changes were detected.",
+                                str(config["page_url"]),
+                            ),
+                            [heartbeat_recipient],
+                        )
+                        runtime["last_heartbeat_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+                        record_history(
+                            "heartbeat",
+                            "Weekly health summary sent",
+                            [f"Monitoring {len(snapshot['documents'])} documents", "No MDOT changes detected"],
+                            int(config["history_limit"]),
+                        )
+                    else:
+                        logger.warning("Weekly health summary was due, but no failure recipient is configured")
+                save_success_runtime(runtime, snapshot, started)
+                cleanup_preview_cache(snapshot)
                 logger.info("No MDOT updates detected")
                 return 0
 
-            recipients = list(load_config(require_recipients=True)["recipients"])
-            subject = f"[MDOT Standards] {change_count(changes)} update(s) detected"
-            send_outlook(subject, format_change_email(changes, snapshot), recipients)
+            confirmation_delay = float(config["confirmation_delay_seconds"])
+            if confirmation_delay > 0 and not getattr(args, "no_confirm", False):
+                logger.info("Waiting %.1f seconds before confirming detected changes", confirmation_delay)
+                time.sleep(confirmation_delay)
+                confirmed_snapshot = retry_operation(
+                    create_snapshot,
+                    int(config["retry_attempts"]),
+                    float(config["retry_delay_seconds"]),
+                    logger,
+                    "MDOT confirmation snapshot",
+                )
+                confirmed_changes = compare_snapshots(baseline, confirmed_snapshot)
+                if not has_changes(confirmed_changes):
+                    atomic_write_json(STATE_FILE, confirmed_snapshot)
+                    record_history(
+                        "suppressed",
+                        "Transient change suppressed",
+                        ["The first check detected a change, but the confirmation check returned to the baseline."],
+                        int(config["history_limit"]),
+                    )
+                    save_success_runtime(runtime, confirmed_snapshot, started)
+                    cleanup_preview_cache(confirmed_snapshot)
+                    logger.info("Suppressed a transient change that did not survive confirmation")
+                    return 0
+                snapshot = confirmed_snapshot
+                changes = confirmed_changes
+
+            batches = notification_batches(changes, config)
+            if not batches:
+                raise MonitorError("Changes were detected, but no matching notification recipients are configured")
+            for recipients, routed_changes, label in batches:
+                subject = f"[MDOT Standards] {change_count(routed_changes)} update(s) detected"
+                send_outlook(
+                    subject,
+                    format_change_email(routed_changes, snapshot),
+                    recipients,
+                    inline_images_for_changes(routed_changes),
+                )
+                logger.info("Sent %s update email to %d recipient(s)", label, len(recipients))
             atomic_write_json(STATE_FILE, snapshot)
-            clear_failure_state(config, logger)
-            logger.info("Sent MDOT update email to %d recipient(s)", len(recipients))
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            runtime["last_change_at"] = now
+            runtime["last_notification_at"] = now
+            record_history(
+                "change",
+                f"{change_count(changes)} MDOT update(s) detected",
+                summarize_changes(changes),
+                int(config["history_limit"]),
+                changes,
+                snapshot,
+            )
+            save_success_runtime(runtime, snapshot, started, change_count(changes))
+            cleanup_preview_cache(snapshot)
             return 0
         except Exception as exc:
             logger.exception("Monitor check failed: %s", exc)
             if not args.dry_run:
                 record_failure(exc, config, logger)
+                try:
+                    record_history(
+                        "failure",
+                        "Monitor check failed",
+                        [str(exc)],
+                        int(config.get("history_limit", DEFAULT_HISTORY_LIMIT)),
+                    )
+                except Exception as history_error:
+                    logger.error("Could not update history after failure: %s", history_error)
             return 1
+
+
+def outlook_is_registered() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Outlook.Application\CLSID"):
+            return True
+    except OSError:
+        return False
+
+
+def scheduled_task_status() -> dict[str, object]:
+    if os.name != "nt":
+        return {"installed": False, "state": "Windows only"}
+    script = (
+        f"$task = Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue; "
+        "if ($task) { $info = Get-ScheduledTaskInfo -TaskName $task.TaskName; "
+        "[pscustomobject]@{installed=$true;state=[string]$task.State;last_run=[string]$info.LastRunTime;"
+        "last_result=$info.LastTaskResult;next_run=[string]$info.NextRunTime;"
+        "execute=[string]$task.Actions[0].Execute;arguments=[string]$task.Actions[0].Arguments} | ConvertTo-Json -Compress } "
+        "else { '{\"installed\":false,\"state\":\"Not installed\"}' }"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    try:
+        return json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        return {"installed": False, "state": "Could not query", "error": normalize_text(result.stderr)}
+
+
+def collect_status() -> dict[str, object]:
+    config = load_config(require_recipients=False)
+    runtime = load_runtime()
+    baseline = read_json(STATE_FILE, {}) or {}
+    history = read_json(HISTORY_FILE, []) or []
+    try:
+        chrome = str(find_chrome())
+    except MonitorError:
+        chrome = "Not found"
+    git_revision = "Unknown"
+    result = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=SCRIPT_DIR,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode == 0:
+        git_revision = result.stdout.strip()
+    return {
+        "version": git_revision,
+        "data_directory": str(BASE_DIR),
+        "config_file": str(CONFIG_FILE),
+        "configured_recipients": len(config.get("recipients", [])),
+        "recipient_rules": len(config.get("recipient_rules", [])),
+        "filters": normalize_filters(dict(config.get("filters", {}))),
+        "baseline_generated_at": baseline.get("generated_at", "Not initialized"),
+        "baseline_documents": len(baseline.get("documents", [])),
+        "history_events": len(history) if isinstance(history, list) else 0,
+        "runtime": runtime,
+        "chrome": chrome,
+        "classic_outlook_registered": outlook_is_registered(),
+        "scheduled_task": scheduled_task_status(),
+    }
+
+
+def run_status(as_json: bool = False) -> int:
+    status = collect_status()
+    if as_json:
+        print(json.dumps(status, indent=2, ensure_ascii=False))
+        return 0
+    runtime = status["runtime"]
+    task = status["scheduled_task"]
+    lines = [
+        "MDOT Standards Monitor status",
+        f"  Version: {status['version']}",
+        f"  Baseline: {status['baseline_documents']} documents ({status['baseline_generated_at']})",
+        f"  Last success: {runtime.get('last_success_at') or 'Never recorded'}",
+        f"  Last change: {runtime.get('last_change_at') or 'None recorded'}",
+        f"  Last error: {runtime.get('last_error') or 'None'}",
+        f"  Consecutive failures: {runtime.get('consecutive_failures', 0)}",
+        f"  Last run duration: {runtime.get('last_duration_seconds', 0)} seconds",
+        f"  History events: {status['history_events']}",
+        f"  Recipients: {status['configured_recipients']} global, {status['recipient_rules']} routing rule(s)",
+        f"  Chrome: {status['chrome']}",
+        f"  Classic Outlook registered: {'Yes' if status['classic_outlook_registered'] else 'No'}",
+        f"  Scheduled task: {task.get('state', 'Unknown')}",
+    ]
+    if task.get("installed"):
+        lines.extend([
+            f"  Task last run: {task.get('last_run') or 'Unknown'} (result {task.get('last_result')})",
+            f"  Task next run: {task.get('next_run') or 'Unknown'}",
+        ])
+    lines.append(f"  Data: {status['data_directory']}")
+    print("\n".join(lines))
+    return 0
+
+
+def run_history(open_dashboard: bool = False) -> int:
+    events = read_json(HISTORY_FILE, []) or []
+    if not isinstance(events, list):
+        raise MonitorError(f"History is malformed: {HISTORY_FILE}")
+    write_history_dashboard(events)
+    print(f"History contains {len(events)} event(s).")
+    print(f"Dashboard: {HISTORY_DASHBOARD}")
+    if open_dashboard:
+        import webbrowser
+        webbrowser.open(HISTORY_DASHBOARD.resolve().as_uri())
+    return 0
+
+
+def valid_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[^\s;@]+@[^\s;@]+\.[^\s;@]+", value.strip()))
+
+
+def save_config(config: dict[str, object]) -> None:
+    atomic_write_json(CONFIG_FILE, config)
+    load_config(require_recipients=False)
+
+
+def run_config_command(args: argparse.Namespace) -> int:
+    config = load_config(require_recipients=False)
+    action = args.config_action
+    if action == "show":
+        print(json.dumps(config, indent=2, ensure_ascii=False))
+        return 0
+    if action == "validate":
+        print(f"Configuration is valid: {CONFIG_FILE}")
+        return 0
+    if action in {"add-recipient", "remove-recipient", "set-failure-recipient"}:
+        address = args.email.strip()
+        if action != "remove-recipient" and address and not valid_email(address):
+            raise MonitorError(f"Recipient does not look like an email address: {address}")
+        if action == "add-recipient":
+            config["recipients"] = list(dict.fromkeys(list(config["recipients"]) + [address]))
+        elif action == "remove-recipient":
+            config["recipients"] = [value for value in config["recipients"] if str(value).casefold() != address.casefold()]
+        else:
+            config["failure_recipient"] = address
+    elif action == "set-filter":
+        config["filters"] = {
+            "sections": list(args.section or []),
+            "titles": list(args.title or []),
+            "extensions": [("." + value.lstrip(".")).lower() for value in (args.extension or [])],
+        }
+    elif action == "clear-filters":
+        config["filters"] = {"sections": [], "titles": [], "extensions": []}
+    elif action == "add-route":
+        recipients = [value.strip() for value in args.recipients.split(";") if value.strip()]
+        invalid = [value for value in recipients if not valid_email(value)]
+        if invalid:
+            raise MonitorError("Invalid route recipient(s): " + ", ".join(invalid))
+        route = {
+            "name": args.name,
+            "recipients": recipients,
+            "include_page_text": bool(args.include_page_text),
+            "filters": {
+                "sections": list(args.section or []),
+                "titles": list(args.title or []),
+                "extensions": [("." + value.lstrip(".")).lower() for value in (args.extension or [])],
+            },
+        }
+        config["recipient_rules"] = [rule for rule in config["recipient_rules"] if str(rule["name"]).casefold() != args.name.casefold()]
+        config["recipient_rules"].append(route)
+    elif action == "remove-route":
+        config["recipient_rules"] = [rule for rule in config["recipient_rules"] if str(rule["name"]).casefold() != args.name.casefold()]
+    elif action == "set-heartbeat-days":
+        if args.days < 0:
+            raise MonitorError("Heartbeat days cannot be negative")
+        config["heartbeat_days"] = args.days
+    elif action == "set-confirmation-delay":
+        if args.seconds < 0:
+            raise MonitorError("Confirmation delay cannot be negative")
+        config["confirmation_delay_seconds"] = args.seconds
+    else:
+        raise MonitorError(f"Unknown configuration action: {action}")
+    save_config(config)
+    print(f"Configuration updated: {CONFIG_FILE}")
+    return 0
+
+
+def git_command(arguments: list[str], cwd: Path = SCRIPT_DIR, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["git", *arguments], cwd=cwd, capture_output=True, text=True, timeout=300, check=False
+    )
+    if check and result.returncode != 0:
+        raise MonitorError(normalize_text(result.stderr or result.stdout) or f"git {' '.join(arguments)} failed")
+    return result
+
+
+def run_update(check_only: bool = False) -> int:
+    if git_command(["status", "--porcelain"]).stdout.strip():
+        raise MonitorError("The repository has local changes. Commit or preserve them before updating.")
+    branch = git_command(["branch", "--show-current"]).stdout.strip()
+    if not branch:
+        raise MonitorError("The repository is in detached-HEAD state")
+    git_command(["fetch", "origin", branch])
+    local = git_command(["rev-parse", "HEAD"]).stdout.strip()
+    remote_ref = f"origin/{branch}"
+    remote = git_command(["rev-parse", remote_ref]).stdout.strip()
+    if local == remote:
+        print(f"Already up to date on {branch} ({local[:8]}).")
+        return 0
+    ancestor = git_command(["merge-base", "--is-ancestor", local, remote_ref], check=False)
+    if ancestor.returncode != 0:
+        raise MonitorError(f"Local {branch} has diverged from {remote_ref}; automatic update was stopped")
+    if check_only:
+        print(f"Update available: {local[:8]} → {remote[:8]}")
+        return 0
+    with tempfile.TemporaryDirectory(prefix="mdot-monitor-update-") as parent:
+        candidate = Path(parent) / "candidate"
+        git_command(["worktree", "add", "--detach", str(candidate), remote_ref])
+        try:
+            tests = subprocess.run(
+                [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+                cwd=candidate,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+            if tests.returncode != 0:
+                raise MonitorError("Candidate update failed its tests:\n" + (tests.stdout + tests.stderr)[-4000:])
+        finally:
+            git_command(["worktree", "remove", "--force", str(candidate)], check=False)
+    git_command(["merge", "--ff-only", remote_ref])
+    print(f"Updated {branch}: {local[:8]} → {remote[:8]}; candidate tests passed.")
+    print("The existing scheduled task will use the updated files on its next run.")
+    return 0
 
 
 def send_test() -> int:
@@ -1293,6 +2042,7 @@ def run_local_test(output: Path, open_report: bool = False) -> int:
                     "title": "2025 Design Manual",
                     "section": "Local test documents",
                 }],
+                preview_root=site / "previews",
             )
 
             write_page(page_path, "Minimum pavement thickness is 8 inches.", "2026 Design Manual", True)
@@ -1315,13 +2065,19 @@ def run_local_test(output: Path, open_report: bool = False) -> int:
                         "section": "Local test documents",
                     },
                 ],
+                preview_root=site / "previews",
             )
+            changes = compare_snapshots(old_snapshot, new_snapshot)
+            # Materialize temporary thumbnails before the temporary site is removed.
+            for item in changes.get("documents_modified", []):
+                for preview in item.get("previews", []):
+                    preview["old_path"] = preview_image_source(str(preview["old_path"]), "data")
+                    preview["new_path"] = preview_image_source(str(preview["new_path"]), "data")
         finally:
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=5)
 
-    changes = compare_snapshots(old_snapshot, new_snapshot)
     modified_details = [
         str(detail)
         for item in changes["documents_modified"]
@@ -1338,7 +2094,7 @@ def run_local_test(output: Path, open_report: bool = False) -> int:
     if failed:
         raise MonitorError("Local test did not detect: " + ", ".join(failed))
 
-    report = format_change_email(changes, new_snapshot)
+    report = format_change_email(changes, new_snapshot, image_mode="data")
     banner = (
         '<tr><td style="padding:14px 20px;background-color:#d9f0f5;border-bottom:1px solid #8ab8c5;'
         'font-family:Segoe UI,Arial,sans-serif;font-size:13px;line-height:20px;color:#123f4d;">'
@@ -1363,10 +2119,44 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     check = subparsers.add_parser("check", help="Run the normal scheduled check")
     check.add_argument("--dry-run", action="store_true", help="Check without changing state or sending email")
+    check.add_argument("--no-confirm", action="store_true", help="Skip the configured second confirmation check")
     initialize = subparsers.add_parser("initialize", help="Replace the baseline without sending an update email")
     initialize.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
+    initialize.add_argument("--no-confirm", action="store_true", help=argparse.SUPPRESS)
     subparsers.add_parser("send-test", help="Send a test email through Outlook")
     subparsers.add_parser("send-preview", help="Send a labeled example change notification")
+    status = subparsers.add_parser("status", help="Show monitor, dependency, baseline, and scheduled-task health")
+    status.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    history = subparsers.add_parser("history", help="Build or open the local change-history dashboard")
+    history.add_argument("--open", action="store_true", help="Open the dashboard in the default browser")
+    update = subparsers.add_parser("update", help="Safely fast-forward to a tested update from GitHub")
+    update.add_argument("--check-only", action="store_true", help="Fetch and report whether an update is available")
+
+    config_parser = subparsers.add_parser("config", help="View or update monitor configuration")
+    config_actions = config_parser.add_subparsers(dest="config_action", required=True)
+    config_actions.add_parser("show", help="Print the effective configuration")
+    config_actions.add_parser("validate", help="Validate the configuration file")
+    for action_name in ("add-recipient", "remove-recipient", "set-failure-recipient"):
+        action_parser = config_actions.add_parser(action_name)
+        action_parser.add_argument("email")
+    set_filter = config_actions.add_parser("set-filter", help="Replace global document filters")
+    set_filter.add_argument("--section", action="append", help="Section-name substring; repeatable")
+    set_filter.add_argument("--title", action="append", help="Document-title substring; repeatable")
+    set_filter.add_argument("--extension", action="append", help="File extension such as pdf; repeatable")
+    config_actions.add_parser("clear-filters", help="Monitor all sections, titles, and file types")
+    add_route = config_actions.add_parser("add-route", help="Add or replace a filtered recipient route")
+    add_route.add_argument("name")
+    add_route.add_argument("--recipients", required=True, help="Semicolon-separated email addresses")
+    add_route.add_argument("--section", action="append")
+    add_route.add_argument("--title", action="append")
+    add_route.add_argument("--extension", action="append")
+    add_route.add_argument("--include-page-text", action="store_true")
+    remove_route = config_actions.add_parser("remove-route", help="Remove a recipient route by name")
+    remove_route.add_argument("name")
+    heartbeat = config_actions.add_parser("set-heartbeat-days", help="Set weekly-summary interval; zero disables")
+    heartbeat.add_argument("days", type=float)
+    confirmation = config_actions.add_parser("set-confirmation-delay", help="Set seconds before confirming a change")
+    confirmation.add_argument("seconds", type=float)
     local_test = subparsers.add_parser(
         "local-test",
         help="Run an end-to-end test locally without MDOT, Outlook, or Task Scheduler",
@@ -1383,6 +2173,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command in {"status", "history", "config", "update"}:
+        try:
+            if args.command == "status":
+                return run_status(args.json)
+            if args.command == "history":
+                return run_history(args.open)
+            if args.command == "config":
+                return run_config_command(args)
+            return run_update(args.check_only)
+        except Exception as exc:
+            print(f"{args.command.title()} failed: {exc}", file=sys.stderr)
+            return 1
     if args.command == "local-test":
         try:
             return run_local_test(args.output, args.open)

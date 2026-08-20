@@ -6,7 +6,9 @@ param(
     [string]$Subject,
 
     [Parameter(Mandatory = $true)]
-    [string]$HtmlBodyFile
+    [string]$HtmlBodyFile,
+
+    [string]$InlineImagesJsonFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,15 +24,40 @@ if ($recipientList.Count -eq 0) {
 
 $outlook = $null
 $mail = $null
+$inlineAttachments = @()
 try {
     $outlook = New-Object -ComObject Outlook.Application
     $mail = $outlook.CreateItem(0)
     $mail.To = $recipientList -join ';'
     $mail.Subject = $Subject
     $mail.HTMLBody = Get-Content -LiteralPath $HtmlBodyFile -Raw -Encoding UTF8
+    if ($InlineImagesJsonFile) {
+        if (-not (Test-Path -LiteralPath $InlineImagesJsonFile -PathType Leaf)) {
+            throw "Inline-image manifest was not found: $InlineImagesJsonFile"
+        }
+        $inlineImages = @(Get-Content -LiteralPath $InlineImagesJsonFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+        foreach ($image in $inlineImages) {
+            if (-not (Test-Path -LiteralPath $image.path -PathType Leaf)) {
+                throw "Inline image was not found: $($image.path)"
+            }
+            $attachment = $mail.Attachments.Add($image.path)
+            $attachment.PropertyAccessor.SetProperty(
+                'http://schemas.microsoft.com/mapi/proptag/0x3712001F',
+                [string]$image.content_id
+            )
+            $attachment.PropertyAccessor.SetProperty(
+                'http://schemas.microsoft.com/mapi/proptag/0x7FFE000B',
+                $true
+            )
+            $inlineAttachments += $attachment
+        }
+    }
     $mail.Send()
 }
 finally {
+    foreach ($attachment in $inlineAttachments) {
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($attachment)
+    }
     if ($null -ne $mail) {
         [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($mail)
     }

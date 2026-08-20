@@ -1,3 +1,4 @@
+import argparse
 import io
 import tempfile
 import unittest
@@ -372,6 +373,186 @@ class StorageAndEmailTests(unittest.TestCase):
                 self.assertEqual(monitor.default_runtime(), monitor.read_json(monitor.RUNTIME_FILE))
             finally:
                 monitor.RUNTIME_FILE = old_runtime
+
+
+class FeatureTests(unittest.TestCase):
+    def test_weekly_health_summary_uses_only_failure_recipient(self):
+        original_paths = (
+            monitor.STATE_FILE, monitor.RUNTIME_FILE, monitor.LOCK_FILE,
+            monitor.HISTORY_FILE, monitor.HISTORY_DASHBOARD, monitor.HISTORY_REPORTS_DIR,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            try:
+                monitor.STATE_FILE = root / "state.json"
+                monitor.RUNTIME_FILE = root / "runtime.json"
+                monitor.LOCK_FILE = root / "monitor.lock"
+                monitor.HISTORY_FILE = root / "history.json"
+                monitor.HISTORY_DASHBOARD = root / "history.html"
+                monitor.HISTORY_REPORTS_DIR = root / "reports"
+                current = snapshot(documents=[document("https://mdot.ms.gov/documents/a.pdf", "A", "same")])
+                current.update({"generated_at": "now", "page_url": monitor.DEFAULT_URL})
+                monitor.atomic_write_json(monitor.STATE_FILE, current)
+                runtime = monitor.default_runtime()
+                runtime.update({"last_success_at": "2020-01-01T00:00:00+00:00", "last_heartbeat_at": "2020-01-01T00:00:00+00:00"})
+                monitor.atomic_write_json(monitor.RUNTIME_FILE, runtime)
+                config = {
+                    "page_url": monitor.DEFAULT_URL,
+                    "recipients": ["whole-team@example.com"],
+                    "failure_recipient": "owner@example.com",
+                    "extra_documents": [], "dynamic_documents": [], "filters": {}, "recipient_rules": [],
+                    "retry_attempts": 1, "retry_delay_seconds": 0,
+                    "confirmation_delay_seconds": 0, "heartbeat_days": 7, "history_limit": 10,
+                }
+                args = argparse.Namespace(dry_run=False, initialize=False, no_confirm=False)
+                with mock.patch("monitor.load_config", return_value=config), \
+                     mock.patch("monitor.build_snapshot", return_value=current), \
+                     mock.patch("monitor.setup_logging", return_value=mock.Mock()), \
+                     mock.patch("monitor.send_outlook") as sender, \
+                     mock.patch("monitor.cleanup_preview_cache"):
+                    self.assertEqual(0, monitor.run_check(args))
+                sender.assert_called_once()
+                self.assertEqual(["owner@example.com"], sender.call_args.args[2])
+            finally:
+                (
+                    monitor.STATE_FILE, monitor.RUNTIME_FILE, monitor.LOCK_FILE,
+                    monitor.HISTORY_FILE, monitor.HISTORY_DASHBOARD, monitor.HISTORY_REPORTS_DIR,
+                ) = original_paths
+
+    def test_old_pdf_analysis_without_previews_is_rebuilt_after_upgrade(self):
+        old_pdf_analysis = {"kind": "pdf_pages", "pages": [{"page": 1, "visual_sha256": "x"}]}
+        self.assertFalse(monitor.analysis_can_be_reused(old_pdf_analysis, store_previews=True))
+        self.assertTrue(monitor.analysis_can_be_reused(old_pdf_analysis, store_previews=False))
+        self.assertTrue(monitor.analysis_can_be_reused({"kind": "lines", "lines": ["x"]}, store_previews=True))
+
+    def test_retry_operation_recovers_from_temporary_failure(self):
+        operation = mock.Mock(side_effect=[monitor.MonitorError("temporary"), "ok"])
+        with mock.patch("monitor.time.sleep") as sleeper:
+            result = monitor.retry_operation(operation, 3, 2, mock.Mock(), "test")
+        self.assertEqual("ok", result)
+        sleeper.assert_called_once_with(2)
+
+    def test_document_filters_match_section_title_and_extension(self):
+        item = {
+            "title": "Bridge Design Manual",
+            "section": "Bridge Standards",
+            "url": "https://mdot.ms.gov/documents/bridge/manual.pdf",
+        }
+        self.assertTrue(monitor.item_matches_filters(item, {
+            "sections": ["bridge"], "titles": ["design"], "extensions": ["pdf"],
+        }))
+        self.assertFalse(monitor.item_matches_filters(item, {"sections": ["roadway"]}))
+
+    def test_filtered_recipient_route_receives_only_matching_changes(self):
+        bridge = document("https://mdot.ms.gov/documents/bridge.pdf", "Bridge Manual", "b")
+        bridge["section"] = "Bridge"
+        roadway = document("https://mdot.ms.gov/documents/road.pdf", "Road Manual", "r")
+        roadway["section"] = "Roadway"
+        changes = monitor.compare_snapshots(snapshot(), snapshot(documents=[bridge, roadway]))
+        batches = monitor.notification_batches(changes, {
+            "recipients": [],
+            "recipient_rules": [{
+                "name": "Bridge team",
+                "recipients": ["bridge@example.com"],
+                "filters": {"sections": ["Bridge"]},
+            }],
+        })
+        self.assertEqual(1, len(batches))
+        self.assertEqual(["bridge@example.com"], batches[0][0])
+        self.assertEqual([bridge], batches[0][1]["documents_added"])
+
+    def test_pdf_comparison_exposes_before_and_after_previews(self):
+        import pymupdf
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_path, new_path = root / "old.pdf", root / "new.pdf"
+            for path, value in ((old_path, "Six inches"), (new_path, "Eight inches")):
+                with pymupdf.open() as pdf:
+                    page = pdf.new_page()
+                    page.insert_text((72, 72), value)
+                    pdf.save(path)
+            old_doc = document("https://mdot.ms.gov/documents/a.pdf", "Manual", "old")
+            new_doc = document("https://mdot.ms.gov/documents/a.pdf", "Manual", "new")
+            old_doc["analysis"] = monitor.analyze_pdf(old_path, root / "old-previews")
+            new_doc["analysis"] = monitor.analyze_pdf(new_path, root / "new-previews")
+            changes = monitor.compare_snapshots(snapshot(documents=[old_doc]), snapshot(documents=[new_doc]))
+            self.assertEqual(1, len(changes["documents_modified"][0]["previews"]))
+            current = snapshot(documents=[new_doc])
+            current.update({"generated_at": "now", "page_url": monitor.DEFAULT_URL})
+            body = monitor.format_change_email(changes, current, image_mode="data")
+            self.assertIn("BEFORE — PAGE 1", body)
+            self.assertIn("data:image/png;base64,", body)
+
+    def test_history_writes_dashboard_and_change_report(self):
+        old_paths = (monitor.HISTORY_FILE, monitor.HISTORY_DASHBOARD, monitor.HISTORY_REPORTS_DIR)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            try:
+                monitor.HISTORY_FILE = root / "history.json"
+                monitor.HISTORY_DASHBOARD = root / "history.html"
+                monitor.HISTORY_REPORTS_DIR = root / "reports"
+                changes = monitor.compare_snapshots(snapshot(), snapshot(documents=[
+                    document("https://mdot.ms.gov/documents/a.pdf", "New Manual", "new")
+                ]))
+                current = snapshot()
+                current.update({"generated_at": "now", "page_url": monitor.DEFAULT_URL})
+                event = monitor.record_history("change", "One change", ["1 document added"], 10, changes, current)
+                self.assertTrue(Path(str(event["report"])).is_file())
+                self.assertIn("One change", monitor.HISTORY_DASHBOARD.read_text(encoding="utf-8"))
+            finally:
+                monitor.HISTORY_FILE, monitor.HISTORY_DASHBOARD, monitor.HISTORY_REPORTS_DIR = old_paths
+
+    def test_confirmation_suppresses_transient_change_without_email(self):
+        original_paths = (
+            monitor.STATE_FILE, monitor.RUNTIME_FILE, monitor.LOCK_FILE,
+            monitor.HISTORY_FILE, monitor.HISTORY_DASHBOARD, monitor.HISTORY_REPORTS_DIR,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            try:
+                monitor.STATE_FILE = root / "state.json"
+                monitor.RUNTIME_FILE = root / "runtime.json"
+                monitor.LOCK_FILE = root / "monitor.lock"
+                monitor.HISTORY_FILE = root / "history.json"
+                monitor.HISTORY_DASHBOARD = root / "history.html"
+                monitor.HISTORY_REPORTS_DIR = root / "reports"
+                baseline = snapshot(documents=[document("https://mdot.ms.gov/documents/a.pdf", "A", "old")])
+                baseline.update({"generated_at": "old", "page_url": monitor.DEFAULT_URL})
+                changed = snapshot(documents=[document("https://mdot.ms.gov/documents/a.pdf", "A", "new")])
+                changed.update({"generated_at": "new", "page_url": monitor.DEFAULT_URL})
+                monitor.atomic_write_json(monitor.STATE_FILE, baseline)
+                config = {
+                    "page_url": monitor.DEFAULT_URL, "recipients": ["team@example.com"],
+                    "failure_recipient": "", "extra_documents": [], "dynamic_documents": [],
+                    "filters": {}, "recipient_rules": [], "retry_attempts": 1,
+                    "retry_delay_seconds": 0, "confirmation_delay_seconds": 1,
+                    "heartbeat_days": 0, "history_limit": 10,
+                }
+                args = argparse.Namespace(dry_run=False, initialize=False, no_confirm=False)
+                with mock.patch("monitor.load_config", return_value=config), \
+                     mock.patch("monitor.build_snapshot", side_effect=[changed, baseline]), \
+                     mock.patch("monitor.setup_logging", return_value=mock.Mock()), \
+                     mock.patch("monitor.time.sleep"), \
+                     mock.patch("monitor.send_outlook") as sender, \
+                     mock.patch("monitor.cleanup_preview_cache"):
+                    self.assertEqual(0, monitor.run_check(args))
+                    sender.assert_not_called()
+                events = monitor.read_json(monitor.HISTORY_FILE)
+                self.assertEqual("suppressed", events[0]["kind"])
+            finally:
+                (
+                    monitor.STATE_FILE, monitor.RUNTIME_FILE, monitor.LOCK_FILE,
+                    monitor.HISTORY_FILE, monitor.HISTORY_DASHBOARD, monitor.HISTORY_REPORTS_DIR,
+                ) = original_paths
+
+    def test_new_commands_are_available(self):
+        parser = monitor.build_parser()
+        self.assertEqual("status", parser.parse_args(["status"]).command)
+        self.assertEqual("history", parser.parse_args(["history"]).command)
+        self.assertEqual("update", parser.parse_args(["update", "--check-only"]).command)
+        config_args = parser.parse_args(["config", "set-heartbeat-days", "7"])
+        self.assertEqual("set-heartbeat-days", config_args.config_action)
 
 
 if __name__ == "__main__":
