@@ -789,56 +789,171 @@ def change_count(changes: dict[str, object]) -> int:
 def format_change_email(changes: dict[str, object], snapshot: dict[str, object]) -> str:
     e = html_module.escape
     sections: list[str] = []
+    link_style = (
+        "color:#176b87;text-decoration:underline;font-weight:600;"
+        "word-break:break-word;overflow-wrap:anywhere;"
+    )
 
-    def doc_list(title: str, items: Iterable[dict[str, object]], formatter) -> None:
+    def link(url: object, title: object) -> str:
+        return f'<a href="{e(str(url))}" style="{link_style}">{e(str(title))}</a>'
+
+    def item_rows(items: Iterable[dict[str, object]], formatter) -> str:
         rendered = list(items)
-        if rendered:
-            sections.append(f"<h3>{e(title)}</h3><ul>" + "".join(f"<li>{formatter(item)}</li>" for item in rendered) + "</ul>")
+        return (
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+            + "".join(
+                '<tr><td width="20" valign="top" style="padding:0 8px 11px 0;'
+                'font-family:Segoe UI,Arial,sans-serif;font-size:16px;line-height:22px;color:#d97706;">&#8226;</td>'
+                '<td valign="top" style="padding:0 0 11px 0;font-family:Segoe UI,Arial,sans-serif;'
+                'font-size:15px;line-height:22px;color:#253746;word-break:break-word;overflow-wrap:anywhere;">'
+                f"{formatter(item)}</td></tr>"
+                for item in rendered
+            )
+            + "</table>"
+        )
+
+    def add_section(title: str, items: Iterable[dict[str, object]], formatter) -> None:
+        rendered = list(items)
+        if not rendered:
+            return
+        content = item_rows(rendered, formatter)
+        sections.append(
+            '<tr><td style="padding:0 28px 16px 28px;">'
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+            'style="border:1px solid #d7e0e5;border-collapse:separate;">'
+            '<tr><td style="padding:12px 16px;background-color:#f2f6f8;border-bottom:1px solid #d7e0e5;'
+            'font-family:Segoe UI,Arial,sans-serif;font-size:16px;line-height:22px;font-weight:700;color:#12324a;">'
+            f'{e(title)} <span style="font-size:12px;line-height:18px;color:#526675;font-weight:600;">({len(rendered)})</span>'
+            '</td></tr><tr><td style="padding:15px 16px 4px 16px;">'
+            f"{content}</td></tr></table></td></tr>"
+        )
 
     def modified_document(item: dict[str, object]) -> str:
         new_document = item["new"]
         details = list(item.get("details", []))
         detail_html = ""
         if details:
-            detail_html = "<ul>" + "".join(f"<li>{e(str(detail))}</li>" for detail in details) + "</ul>"
-        return f'<a href="{e(str(new_document["url"]))}">{e(str(new_document["title"]))}</a>{detail_html}'
+            detail_html = (
+                '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+                'style="margin-top:9px;background-color:#f7fafb;border-left:4px solid #5b8fa3;">'
+                + "".join(
+                    '<tr><td style="padding:8px 10px;font-family:Segoe UI,Arial,sans-serif;font-size:13px;'
+                    'line-height:19px;color:#405463;word-break:break-word;overflow-wrap:anywhere;">'
+                    f"{e(str(detail))}</td></tr>"
+                    for detail in details
+                )
+                + "</table>"
+            )
+        return f'{link(new_document["url"], new_document["title"])}{detail_html}'
 
-    doc_list("Documents added", changes["documents_added"], lambda x: f'<a href="{e(str(x["url"]))}">{e(str(x["title"]))}</a>')
-    doc_list("Documents removed", changes["documents_removed"], lambda x: e(str(x["title"])))
-    doc_list("Document contents modified", changes["documents_modified"], modified_document)
-    doc_list("Documents renamed", changes["documents_renamed"], lambda x: f'{e(str(x["old"]["title"]))} &rarr; <a href="{e(str(x["new"]["url"]))}">{e(str(x["new"]["title"]))}</a>')
-    doc_list("Document links changed", changes["documents_relinked"], lambda x: f'{e(str(x["old"]["url"]))} &rarr; <a href="{e(str(x["new"]["url"]))}">{e(str(x["new"]["title"]))}</a>')
-    doc_list("Documents moved or replaced at a new URL", changes["documents_moved"], lambda x: f'{e(str(x["old"]["url"]))} &rarr; <a href="{e(str(x["new"]["url"]))}">{e(str(x["new"]["title"]))}</a>')
-    doc_list("Links added", changes["links_added"], lambda x: f'<a href="{e(str(x["url"]))}">{e(str(x["title"]))}</a>')
-    doc_list("Links removed", changes["links_removed"], lambda x: e(f'{x["title"]} ({x["url"]})'))
-    doc_list("Link titles changed", changes["links_renamed"], lambda x: f'{e(str(x["old_title"]))} &rarr; <a href="{e(str(x["url"]))}">{e(str(x["new_title"]))}</a>')
+    add_section("Documents added", changes["documents_added"], lambda x: link(x["url"], x["title"]))
+    add_section("Documents removed", changes["documents_removed"], lambda x: e(str(x["title"])))
+    add_section("Document contents modified", changes["documents_modified"], modified_document)
+    add_section(
+        "Documents renamed",
+        changes["documents_renamed"],
+        lambda x: f'{e(str(x["old"]["title"]))} <span style="color:#7a8994;">&rarr;</span> '
+        f'{link(x["new"]["url"], x["new"]["title"])}',
+    )
+    add_section(
+        "Document links changed",
+        changes["documents_relinked"],
+        lambda x: f'<span style="color:#526675;word-break:break-all;">{e(str(x["old"]["url"]))}</span> '
+        f'<span style="color:#7a8994;">&rarr;</span> {link(x["new"]["url"], x["new"]["title"])}',
+    )
+    add_section(
+        "Documents moved or replaced at a new URL",
+        changes["documents_moved"],
+        lambda x: f'<span style="color:#526675;word-break:break-all;">{e(str(x["old"]["url"]))}</span> '
+        f'<span style="color:#7a8994;">&rarr;</span> {link(x["new"]["url"], x["new"]["title"])}',
+    )
+    add_section("Links added", changes["links_added"], lambda x: link(x["url"], x["title"]))
+    add_section(
+        "Links removed",
+        changes["links_removed"],
+        lambda x: f'{e(str(x["title"]))}<br><span style="font-size:12px;color:#687985;word-break:break-all;">'
+        f'{e(str(x["url"]))}</span>',
+    )
+    add_section(
+        "Link titles changed",
+        changes["links_renamed"],
+        lambda x: f'{e(str(x["old_title"]))} <span style="color:#7a8994;">&rarr;</span> '
+        f'{link(x["url"], x["new_title"])}',
+    )
     if changes["page_text_changed"]:
         page_details = list(changes.get("page_text_details", []))
-        detail_html = ""
-        if page_details:
-            detail_html = "<ul>" + "".join(f"<li>{e(str(detail))}</li>" for detail in page_details) + "</ul>"
+        detail_items = [{"detail": detail} for detail in page_details]
+        detail_html = item_rows(detail_items, lambda item: e(str(item["detail"]))) if detail_items else ""
         sections.insert(
             0,
-            "<h3>Page content changed</h3><p>Visible headings or explanatory text changed.</p>" + detail_html,
+            '<tr><td style="padding:0 28px 16px 28px;">'
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+            'style="border:1px solid #d7e0e5;border-collapse:separate;">'
+            '<tr><td style="padding:12px 16px;background-color:#f2f6f8;border-bottom:1px solid #d7e0e5;'
+            'font-family:Segoe UI,Arial,sans-serif;font-size:16px;line-height:22px;font-weight:700;color:#12324a;">'
+            'Page content changed</td></tr><tr><td style="padding:14px 16px 4px 16px;">'
+            '<p style="margin:0 0 12px 0;font-family:Segoe UI,Arial,sans-serif;font-size:14px;line-height:21px;color:#526675;">'
+            'Visible headings or explanatory text changed.</p>'
+            f"{detail_html}</td></tr></table></td></tr>",
         )
     checked = e(str(snapshot["generated_at"]))
     page_url = e(str(snapshot["page_url"]))
+    total = change_count(changes)
     return (
-        "<html><body style='font-family:Segoe UI,Arial,sans-serif'>"
-        "<h2>MDOT Engineering Standards update detected</h2>"
-        f"<p>The daily check found {change_count(changes)} change(s) at {checked}.</p>"
+        '<!doctype html><html><head><meta charset="utf-8"></head>'
+        '<body style="margin:0;padding:0;background-color:#eaf0f3;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#eaf0f3;">'
+        '<tr><td align="center" style="padding:24px 10px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        'style="width:100%;max-width:760px;background-color:#ffffff;border:1px solid #ced9df;">'
+        '<!-- LOCAL-TEST-BANNER -->'
+        '<tr><td style="padding:0;background-color:#d97706;height:6px;font-size:0;line-height:0;">&nbsp;</td></tr>'
+        '<tr><td style="padding:28px;background-color:#12324a;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>'
+        '<td valign="middle" style="font-family:Segoe UI,Arial,sans-serif;color:#ffffff;">'
+        '<div style="font-size:12px;line-height:18px;font-weight:700;letter-spacing:1px;color:#9fd3e3;">MDOT STANDARDS MONITOR</div>'
+        '<div style="padding-top:5px;font-size:25px;line-height:32px;font-weight:700;">Engineering standards update</div>'
+        '</td><td width="92" align="center" valign="middle" style="padding-left:16px;">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="background-color:#ffffff;">'
+        f'<tr><td align="center" style="padding:9px 14px;font-family:Segoe UI,Arial,sans-serif;font-size:24px;line-height:26px;font-weight:700;color:#12324a;">{total}</td></tr>'
+        '<tr><td align="center" style="padding:0 10px 8px 10px;font-family:Segoe UI,Arial,sans-serif;font-size:10px;line-height:12px;font-weight:700;color:#526675;">CHANGES</td></tr>'
+        '</table></td></tr></table></td></tr>'
+        '<tr><td style="padding:20px 28px 18px 28px;">'
+        '<p style="margin:0;font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:23px;color:#364b5a;">'
+        f'The daily check detected <strong>{total} change(s)</strong>.</p>'
+        '<p style="margin:5px 0 0 0;font-family:Segoe UI,Arial,sans-serif;font-size:12px;line-height:18px;color:#71818c;">'
+        f'Checked {checked}</p></td></tr>'
         + "".join(sections)
-        + f'<p><a href="{page_url}">Open the MDOT Engineering Standards/Guides/Manuals page</a></p>'
-        "<p style='color:#666;font-size:9pt'>Automated by MDOT Standards Monitor.</p></body></html>"
+        + '<tr><td style="padding:4px 28px 28px 28px;">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>'
+        '<td style="background-color:#176b87;padding:12px 18px;">'
+        f'<a href="{page_url}" style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;line-height:18px;font-weight:700;color:#ffffff;text-decoration:none;">Open MDOT standards page&nbsp;&rarr;</a>'
+        '</td></tr></table></td></tr>'
+        '<tr><td style="padding:16px 28px;background-color:#f2f6f8;border-top:1px solid #d7e0e5;'
+        'font-family:Segoe UI,Arial,sans-serif;font-size:11px;line-height:17px;color:#687985;">'
+        'Automated by MDOT Standards Monitor. This message reports detected changes; it does not modify MDOT content.'
+        '</td></tr></table></td></tr></table></body></html>'
     )
 
 
 def format_status_email(title: str, message: str, page_url: str) -> str:
     return (
-        "<html><body style='font-family:Segoe UI,Arial,sans-serif'>"
-        f"<h2>{html_module.escape(title)}</h2><p>{html_module.escape(message)}</p>"
-        f'<p><a href="{html_module.escape(page_url)}">Open the monitored MDOT page</a></p>'
-        "</body></html>"
+        '<!doctype html><html><head><meta charset="utf-8"></head>'
+        '<body style="margin:0;padding:0;background-color:#eaf0f3;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>'
+        '<td align="center" style="padding:24px 10px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        'style="width:100%;max-width:680px;background-color:#ffffff;border:1px solid #ced9df;">'
+        '<tr><td style="padding:0;background-color:#d97706;height:6px;font-size:0;line-height:0;">&nbsp;</td></tr>'
+        '<tr><td style="padding:24px 28px;background-color:#12324a;font-family:Segoe UI,Arial,sans-serif;'
+        f'font-size:22px;line-height:29px;font-weight:700;color:#ffffff;">{html_module.escape(title)}</td></tr>'
+        '<tr><td style="padding:24px 28px;font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:23px;color:#364b5a;">'
+        f'{html_module.escape(message)}</td></tr><tr><td style="padding:0 28px 28px 28px;">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>'
+        '<td style="background-color:#176b87;padding:12px 18px;">'
+        f'<a href="{html_module.escape(page_url)}" style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;'
+        'line-height:18px;font-weight:700;color:#ffffff;text-decoration:none;">Open monitored MDOT page&nbsp;&rarr;</a>'
+        '</td></tr></table></td></tr></table></td></tr></table></body></html>'
     )
 
 
@@ -1101,17 +1216,145 @@ def send_change_preview() -> int:
     }
     body = format_change_email(changes, snapshot)
     banner = (
-        "<div style='padding:12px;background:#fff3cd;border:1px solid #d39e00;"
-        "font-weight:700'>TEST PREVIEW ONLY — No real MDOT change was detected. "
-        "The items below are fictional examples.</div>"
+        '<tr><td style="padding:14px 20px;background-color:#fff3cd;border-bottom:1px solid #d39e00;'
+        'font-family:Segoe UI,Arial,sans-serif;font-size:13px;line-height:20px;color:#604b00;">'
+        '<strong>TEST PREVIEW ONLY — No real MDOT change was detected.</strong><br>'
+        'The items below are fictional examples.</td></tr>'
     )
-    body = body.replace("<h2>", banner + "<h2>", 1)
+    body = body.replace("<!-- LOCAL-TEST-BANNER -->", banner, 1)
     send_outlook(
         "[MDOT Standards] TEST PREVIEW — Example change notification",
         body,
         recipients,
     )
     print(f"Change-preview email sent to {len(recipients)} recipient(s).")
+    return 0
+
+
+def run_local_test(output: Path, open_report: bool = False) -> int:
+    """Exercise the monitoring pipeline against a temporary local MDOT-like site."""
+    from functools import partial
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    import webbrowser
+
+    try:
+        import pymupdf
+    except ImportError as exc:
+        raise MonitorError("PyMuPDF is required for the local end-to-end test") from exc
+
+    class QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    def write_pdf(path: Path, requirement: str) -> None:
+        with pymupdf.open() as document:
+            cover = document.new_page()
+            cover.insert_text((72, 72), "Local test design manual")
+            requirement_page = document.new_page()
+            requirement_page.insert_text((72, 72), requirement)
+            document.save(path)
+
+    def write_page(path: Path, requirement: str, manual_title: str, include_bulletin: bool) -> None:
+        bulletin = '<a href="/bulletin.txt">New construction bulletin</a>' if include_bulletin else ""
+        path.write_text(
+            "<html><body><main><h1>Engineering Standards</h1>"
+            f"<p>{html_module.escape(requirement)}</p>"
+            f'<a href="/manual.pdf">{html_module.escape(manual_title)}</a>'
+            f"{bulletin}</main></body></html>",
+            encoding="utf-8",
+        )
+
+    logger = logging.getLogger(APP_NAME + ".local-test")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    with tempfile.TemporaryDirectory(prefix="mdot-monitor-local-test-") as directory:
+        site = Path(directory)
+        page_path = site / "index.html"
+        manual_path = site / "manual.pdf"
+        bulletin_path = site / "bulletin.txt"
+        handler = partial(QuietHandler, directory=str(site))
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        page_url = base_url + "/index.html"
+        try:
+            write_page(page_path, "Minimum pavement thickness is 6 inches.", "2025 Design Manual", False)
+            write_pdf(manual_path, "Minimum pavement thickness: 6 inches")
+            old_snapshot = build_snapshot(
+                page_url,
+                logger,
+                force_analysis=True,
+                extra_documents=[{
+                    "url": base_url + "/manual.pdf",
+                    "title": "2025 Design Manual",
+                    "section": "Local test documents",
+                }],
+            )
+
+            write_page(page_path, "Minimum pavement thickness is 8 inches.", "2026 Design Manual", True)
+            write_pdf(manual_path, "Minimum pavement thickness: 8 inches")
+            bulletin_path.write_text("New construction bulletin\nEffective immediately\n", encoding="utf-8")
+            new_snapshot = build_snapshot(
+                page_url,
+                logger,
+                previous_snapshot=old_snapshot,
+                force_analysis=True,
+                extra_documents=[
+                    {
+                        "url": base_url + "/manual.pdf",
+                        "title": "2026 Design Manual",
+                        "section": "Local test documents",
+                    },
+                    {
+                        "url": base_url + "/bulletin.txt",
+                        "title": "New construction bulletin",
+                        "section": "Local test documents",
+                    },
+                ],
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+
+    changes = compare_snapshots(old_snapshot, new_snapshot)
+    modified_details = [
+        str(detail)
+        for item in changes["documents_modified"]
+        for detail in item.get("details", [])
+    ]
+    expected_results = {
+        "visible page text change": bool(changes["page_text_changed"]),
+        "added document": len(changes["documents_added"]) == 1,
+        "modified PDF": len(changes["documents_modified"]) == 1,
+        "renamed document": len(changes["documents_renamed"]) == 1,
+        "PDF page-level detail": any("Page 2 changed" in detail for detail in modified_details),
+    }
+    failed = [name for name, passed in expected_results.items() if not passed]
+    if failed:
+        raise MonitorError("Local test did not detect: " + ", ".join(failed))
+
+    report = format_change_email(changes, new_snapshot)
+    banner = (
+        '<tr><td style="padding:14px 20px;background-color:#d9f0f5;border-bottom:1px solid #8ab8c5;'
+        'font-family:Segoe UI,Arial,sans-serif;font-size:13px;line-height:20px;color:#123f4d;">'
+        '<strong>LOCAL END-TO-END TEST — PASS</strong><br>'
+        'Generated from a temporary fictional website. No MDOT state was changed and no email was sent.'
+        '</td></tr>'
+    )
+    report = report.replace("<!-- LOCAL-TEST-BANNER -->", banner, 1)
+    output = output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(report, encoding="utf-8")
+    print(f"Local end-to-end test passed: {change_count(changes)} change(s) detected.")
+    print(f"HTML report: {output}")
+    print("No Outlook message was sent, no scheduled task was created, and saved monitor state was not changed.")
+    if open_report:
+        webbrowser.open(output.as_uri())
     return 0
 
 
@@ -1124,11 +1367,28 @@ def build_parser() -> argparse.ArgumentParser:
     initialize.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
     subparsers.add_parser("send-test", help="Send a test email through Outlook")
     subparsers.add_parser("send-preview", help="Send a labeled example change notification")
+    local_test = subparsers.add_parser(
+        "local-test",
+        help="Run an end-to-end test locally without MDOT, Outlook, or Task Scheduler",
+    )
+    local_test.add_argument(
+        "--output",
+        type=Path,
+        default=BASE_DIR / "local-test-report.html",
+        help="HTML report path (default: %(default)s)",
+    )
+    local_test.add_argument("--open", action="store_true", help="Open the generated report in the default browser")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "local-test":
+        try:
+            return run_local_test(args.output, args.open)
+        except Exception as exc:
+            print(f"Local end-to-end test failed: {exc}", file=sys.stderr)
+            return 1
     if args.command in {"send-test", "send-preview"}:
         try:
             return send_test() if args.command == "send-test" else send_change_preview()

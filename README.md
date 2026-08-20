@@ -34,6 +34,7 @@ py -3.14 .\monitor.py check --dry-run
 py -3.14 .\monitor.py initialize
 py -3.14 .\monitor.py send-test
 py -3.14 .\monitor.py send-preview
+py -3.14 .\monitor.py local-test --open
 .\install.ps1 -Remove
 ```
 
@@ -42,6 +43,10 @@ py -3.14 .\monitor.py send-preview
 - `initialize` deliberately replaces the baseline without sending an update alert.
 - `send-test` sends a clearly labeled test message.
 - `send-preview` sends a clearly labeled fictional example of a change report.
+- `local-test --open` creates a temporary MDOT-like page and documents, changes them, and
+  opens the resulting HTML alert. It exercises Chrome rendering, downloads, hashes, PDF
+  page comparison, change detection, and report formatting without Outlook, Task Scheduler,
+  network access, configured recipients, or changes to the saved baseline.
 - `install.ps1 -Remove` removes the scheduled task but retains configuration and history.
 
 ## Data and troubleshooting

@@ -287,6 +287,13 @@ class StorageAndEmailTests(unittest.TestCase):
             self.assertEqual(["team@example.com"], recipients)
             self.assertTrue(all(url in body for url in real_urls))
 
+    def test_local_test_is_available_without_configuration(self):
+        parser = monitor.build_parser()
+        args = parser.parse_args(["local-test"])
+        self.assertEqual("local-test", args.command)
+        self.assertEqual(monitor.BASE_DIR / "local-test-report.html", args.output)
+        self.assertFalse(args.open)
+
     def test_recipient_config_rejects_non_list(self):
         old_path = monitor.CONFIG_FILE
         with tempfile.TemporaryDirectory() as directory:
