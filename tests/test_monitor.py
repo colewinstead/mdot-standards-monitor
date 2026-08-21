@@ -177,7 +177,11 @@ class ComparisonTests(unittest.TestCase):
         self.assertFalse(changes["folders_added"])
 
     def test_folder_crawl_upgrade_baselines_newly_discovered_content(self):
-        old = snapshot("Collapsed", links=[])
+        old = snapshot("Collapsed", links=[{
+            "url": "https://mdot.ms.gov/portal/obsolete_standards",
+            "title": "Obsolete Standards",
+            "section": "",
+        }])
         old["schema_version"] = 1
         new_doc = document("https://mdot.ms.gov/documents/Roadway%20Design/new.pdf", "New", "digest")
         new = snapshot(
@@ -195,6 +199,8 @@ class ComparisonTests(unittest.TestCase):
         self.assertFalse(changes["documents_added"])
         self.assertFalse(changes["folders_added"])
         self.assertFalse(changes["links_added"])
+        self.assertFalse(changes["links_removed"])
+        self.assertFalse(changes["links_renamed"])
         self.assertFalse(monitor.has_changes(changes))
 
     def test_excluded_construction_documents_do_not_appear_removed(self):

@@ -1133,8 +1133,8 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
         "folders_removed": [old_folders[path] for path in sorted(set(old_folders) - set(new_folders))]
         if compare_folders and not folder_crawl_migration else [],
         "links_added": [] if folder_crawl_migration else link_added,
-        "links_removed": link_removed,
-        "links_renamed": link_renamed,
+        "links_removed": [] if folder_crawl_migration else link_removed,
+        "links_renamed": [] if folder_crawl_migration else link_renamed,
     }
 
 
