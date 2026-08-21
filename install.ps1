@@ -35,19 +35,22 @@ $pythonLauncher = (Get-Command py.exe -ErrorAction SilentlyContinue).Source
 if (-not $pythonLauncher) {
     $pythonLauncher = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
 }
+if (-not $pythonLauncher) {
+    throw 'Python was not found. Install Python 3.11 or newer and rerun this installer.'
+}
 
 $dependencyCheckArguments = if ([IO.Path]::GetFileName($pythonLauncher) -ieq 'py.exe') {
-    @('-3.14', '-c', 'import pymupdf')
+    @('-3.14', '-c', 'import pymupdf, playwright.sync_api')
 }
 else {
-    @('-c', 'import pymupdf')
+    @('-c', 'import pymupdf, playwright.sync_api')
 }
 & $pythonLauncher @dependencyCheckArguments 2>$null
 if ($LASTEXITCODE -ne 0) {
     if (-not (Test-Path -LiteralPath $requirementsFile -PathType Leaf)) {
         throw "Dependency list was not found: $requirementsFile"
     }
-    Write-Host 'Installing PDF and Excel comparison support...'
+    Write-Host 'Installing document comparison and browser automation support...'
     $installDependencyArguments = if ([IO.Path]::GetFileName($pythonLauncher) -ieq 'py.exe') {
         @('-3.14', '-m', 'pip', 'install', '--user', '-r', $requirementsFile)
     }
@@ -59,10 +62,6 @@ if ($LASTEXITCODE -ne 0) {
         throw 'Required Python packages could not be installed.'
     }
 }
-if (-not $pythonLauncher) {
-    throw 'Python was not found. Install Python 3.11 or newer and rerun this installer.'
-}
-
 $chromeCandidates = @(
     (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
     (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),

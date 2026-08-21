@@ -1,6 +1,8 @@
 # MDOT Standards Monitor
 
-This Windows utility checks the MDOT Engineering Standards/Guides/Manuals page every weekday. It renders the JavaScript page in Chrome, compares meaningful page content and links, and SHA-256 hashes every directly linked MDOT document. When something changes, it sends an HTML summary through the signed-in Classic Outlook profile.
+This Windows utility checks the MDOT Engineering Standards/Guides/Manuals page every weekday. It renders the JavaScript page in Chrome, recursively expands the website's collapsed folder grids, compares the folder inventory, meaningful page content, and links, and SHA-256 hashes every discovered MDOT document. When something changes, it sends an HTML summary through the signed-in Classic Outlook profile.
+
+The website sections **Construction** and **Construction Materials** (the latter is represented by the top-level `Materials` category in the site's data grid) are intentionally excluded, including all of their descendant folders and documents. All other current and newly added folders are included automatically. Folder additions and removals are reported separately; document additions, removals, renames, moves, and content modifications use the existing detailed change report.
 
 For modified files, the report also identifies PDF page numbers and text excerpts, Word paragraph changes, Excel sheet/cell changes, and text-file line changes. Modified PDF pages include low-resolution before/after previews, including drawings and scanned pages with no extractable text.
 
@@ -115,7 +117,7 @@ the configuration command to disable the weekly summary.
 Existing installations can pull updates in place. The scheduled task, configuration, baseline, and
 history remain intact; do not rerun `install.ps1` merely to update the program.
 
-The monitor follows changes on the MDOT page and hashes directly linked files hosted by MDOT. It records the presence, title, and URL of third-party links but does not crawl or hash external websites.
+The monitor follows changes on the MDOT page and hashes files exposed by the recursively expanded MDOT folder grids. It records the presence, title, and URL of third-party links but does not crawl or hash external websites.
 
 One ProjectWise-hosted PDF, `RWD Workflow Training ORD`, is dynamically resolved from the RWD CADD Manual on every run. The resolver accepts exactly one link matching the trusted ProjectWise host and download path, so a changed ProjectWise key is followed automatically while every other embedded link remains ignored. Multiple matching destinations cause a safe failure instead of an ambiguous selection.
 

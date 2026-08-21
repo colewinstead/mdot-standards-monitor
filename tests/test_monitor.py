@@ -45,6 +45,25 @@ class PageParsingTests(unittest.TestCase):
         with self.assertRaises(monitor.MonitorError):
             monitor.parse_rendered_page("<html><body>Loading</body></html>", monitor.DEFAULT_URL)
 
+    def test_extracts_expanded_folder_paths_and_assigns_them_to_documents(self):
+        source = """
+        <main><table>
+        <tr class='dx-group-row' data-mdot-folder-path='Roadway Design / Standards'>
+          <td>Standards</td></tr>
+        <tr class='dx-group-row' data-mdot-folder-path='Roadway Design / Standards / Manuals'>
+          <td>Manuals</td></tr>
+        <tr class='dx-data-row'><td>
+          <a data-mdot-folder-path='Roadway Design / Standards / Manuals'
+             href='/documents/Roadway Design/Standards/Manuals/manual.pdf'>Road Manual</a>
+        </td></tr></table></main>
+        """
+        result = monitor.parse_rendered_page(source, monitor.DEFAULT_URL)
+        self.assertEqual(
+            ["Roadway Design / Standards", "Roadway Design / Standards / Manuals"],
+            [item["path"] for item in result["folders"]],
+        )
+        self.assertEqual("Roadway Design / Standards / Manuals", result["links"][0]["section"])
+
 
 class HashTests(unittest.TestCase):
     def test_hash_stream(self):
@@ -67,11 +86,12 @@ class HashTests(unittest.TestCase):
         self.assertEqual(".pdf", extension)
 
 
-def snapshot(text="Page", documents=None, links=None):
+def snapshot(text="Page", documents=None, links=None, folders=None):
     return {
         "page_text": text,
         "documents": documents or [],
         "links": links or [],
+        "folders": folders or [],
     }
 
 
@@ -130,6 +150,61 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(1, len(changes["links_renamed"]))
         self.assertTrue(changes["page_text_details"])
         self.assertEqual(3, monitor.change_count(changes))
+
+    def test_folder_added_and_removed(self):
+        old = snapshot(folders=[{
+            "path": "Roadway Design / Standards / Old Folder",
+            "title": "Old Folder", "section": "Roadway Design / Standards / Old Folder",
+            "url": monitor.DEFAULT_URL,
+        }])
+        new = snapshot(folders=[{
+            "path": "Roadway Design / Standards / New Folder",
+            "title": "New Folder", "section": "Roadway Design / Standards / New Folder",
+            "url": monitor.DEFAULT_URL,
+        }])
+        changes = monitor.compare_snapshots(old, new)
+        self.assertEqual("Roadway Design / Standards / New Folder", changes["folders_added"][0]["path"])
+        self.assertEqual("Roadway Design / Standards / Old Folder", changes["folders_removed"][0]["path"])
+
+    def test_legacy_snapshot_does_not_report_every_existing_folder_as_added(self):
+        old = snapshot()
+        old.pop("folders")
+        new = snapshot(folders=[{
+            "path": "Roadway Design / Standards", "title": "Standards",
+            "section": "Roadway Design / Standards", "url": monitor.DEFAULT_URL,
+        }])
+        changes = monitor.compare_snapshots(old, new)
+        self.assertFalse(changes["folders_added"])
+
+    def test_folder_crawl_upgrade_baselines_newly_discovered_content(self):
+        old = snapshot("Collapsed", links=[])
+        old["schema_version"] = 1
+        new_doc = document("https://mdot.ms.gov/documents/Roadway%20Design/new.pdf", "New", "digest")
+        new = snapshot(
+            "Expanded",
+            documents=[new_doc],
+            links=[{"url": new_doc["url"], "title": new_doc["title"], "section": "Roadway Design"}],
+            folders=[{
+                "path": "Roadway Design", "title": "Roadway Design",
+                "section": "Roadway Design", "url": monitor.DEFAULT_URL,
+            }],
+        )
+        new["schema_version"] = 2
+        changes = monitor.compare_snapshots(old, new)
+        self.assertFalse(changes["page_text_changed"])
+        self.assertFalse(changes["documents_added"])
+        self.assertFalse(changes["folders_added"])
+        self.assertFalse(changes["links_added"])
+        self.assertFalse(monitor.has_changes(changes))
+
+    def test_excluded_construction_documents_do_not_appear_removed(self):
+        construction = document(
+            "https://mdot.ms.gov/documents/Construction/Specifications/spec.pdf",
+            "Specification", "old",
+        )
+        changes = monitor.compare_snapshots(snapshot(documents=[construction]), snapshot())
+        self.assertFalse(changes["documents_removed"])
+        self.assertFalse(monitor.has_changes(changes))
 
 
 class DetailedComparisonTests(unittest.TestCase):

@@ -58,6 +58,7 @@ DEFAULT_CONFIRMATION_DELAY_SECONDS = 120
 DEFAULT_HEARTBEAT_DAYS = 7
 DEFAULT_HISTORY_LIMIT = 100
 MAX_PDF_PREVIEW_PAIRS = 3
+EXCLUDED_TOP_CATEGORIES = {"Construction", "Materials"}
 
 
 class MonitorError(RuntimeError):
@@ -73,6 +74,7 @@ class MainContentParser(HTMLParser):
         self.suppressed_depth = 0
         self.text_parts: list[str] = []
         self.links: list[dict[str, str]] = []
+        self.folders: list[str] = []
         self.current_link: dict[str, object] | None = None
         self.current_heading: list[str] | None = None
         self.section = ""
@@ -80,6 +82,9 @@ class MainContentParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         attr_map = dict(attrs)
+        folder_path = normalize_text(attr_map.get("data-mdot-folder-path") or "")
+        if tag == "tr" and folder_path and folder_path not in self.folders:
+            self.folders.append(folder_path)
         if tag == "main" and not self.in_main:
             self.in_main = True
             return
@@ -92,7 +97,11 @@ class MainContentParser(HTMLParser):
         if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             self.current_heading = []
         if tag == "a" and attr_map.get("href"):
-            self.current_link = {"href": attr_map["href"] or "", "text": []}
+            self.current_link = {
+                "href": attr_map["href"] or "",
+                "text": [],
+                "section": folder_path or self.section,
+            }
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
@@ -110,7 +119,7 @@ class MainContentParser(HTMLParser):
                     {
                         "url": str(self.current_link["href"]),
                         "title": link_text,
-                        "section": self.section,
+                        "section": str(self.current_link.get("section", self.section)),
                     }
                 )
                 self.current_link = None
@@ -171,6 +180,15 @@ def is_mdot_document(url: str) -> bool:
     )
 
 
+def is_excluded_document(item: dict[str, object]) -> bool:
+    """Exclude the two top-level website sections the team does not monitor."""
+    section = str(item.get("section", "")).split(" / ", 1)[0].casefold()
+    if section in {value.casefold() for value in EXCLUDED_TOP_CATEGORIES}:
+        return True
+    path = unquote(urlsplit(str(item.get("url", ""))).path).replace("\\", "/").casefold()
+    return path.startswith("/documents/construction/") or path.startswith("/documents/materials/")
+
+
 def parse_rendered_page(rendered_html: str, page_url: str) -> dict[str, object]:
     parser = MainContentParser()
     parser.feed(rendered_html)
@@ -192,7 +210,16 @@ def parse_rendered_page(rendered_html: str, page_url: str) -> dict[str, object]:
         links.append({"url": normalized[0], "title": normalized[1], "section": normalized[2]})
 
     links.sort(key=lambda item: (item["url"].casefold(), item["title"].casefold()))
-    return {"text": normalize_text(" ".join(parser.text_parts)), "links": links}
+    folders = [
+        {
+            "path": path,
+            "title": path.rsplit(" / ", 1)[-1],
+            "section": path,
+            "url": page_url,
+        }
+        for path in sorted(parser.folders, key=str.casefold)
+    ]
+    return {"text": normalize_text(" ".join(parser.text_parts)), "links": links, "folders": folders}
 
 
 def find_chrome() -> Path:
@@ -212,37 +239,231 @@ def find_chrome() -> Path:
 
 def render_page(url: str, timeout_seconds: int = 90) -> str:
     chrome = find_chrome()
-    with tempfile.TemporaryDirectory(prefix="mdot-monitor-chrome-") as profile:
-        command = [
-            str(chrome),
-            "--headless=new",
-            "--disable-gpu",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--no-first-run",
-            "--no-default-browser-check",
-            f"--user-data-dir={profile}",
-            "--virtual-time-budget=20000",
-            "--dump-dom",
-            url,
-        ]
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_seconds,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise MonitorError(
+            "Playwright is required to expand the MDOT folder tree. Re-run install.ps1 to install dependencies."
+        ) from exc
+
+    timeout_ms = max(1, int(timeout_seconds * 1000))
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(chrome),
+                headless=True,
+                args=[
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
             )
-        except subprocess.TimeoutExpired as exc:
-            raise MonitorError(f"Chrome did not finish rendering within {timeout_seconds} seconds") from exc
-    if result.returncode != 0 or "<main" not in result.stdout.lower():
-        detail = normalize_text(result.stderr)[-500:]
-        raise MonitorError(f"Chrome could not render the MDOT page (exit {result.returncode}): {detail}")
-    return result.stdout
+            try:
+                context = browser.new_context(user_agent=USER_AGENT)
+                page = context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                if urlsplit(url).hostname not in {"mdot.ms.gov", "www.mdot.ms.gov"}:
+                    page.wait_for_selector("main", timeout=timeout_ms)
+                    page.wait_for_timeout(250)
+                    return page.content()
+                page.wait_for_selector(
+                    "main .dx-datagrid tr.dx-group-row",
+                    state="attached",
+                    timeout=timeout_ms,
+                )
+                page.wait_for_timeout(750)
+                folders: set[str] = set()
+                folder_links: dict[tuple[str, str, str], dict[str, str]] = {}
+                included_top_categories: set[str] = set()
+                grid_count = page.locator("main .dx-datagrid").count()
+                for grid_index in range(grid_count):
+                    top_category = page.evaluate(
+                        """(gridIndex) => {
+                            const rowLevel = (row) => {
+                                const cell = row.querySelector('td[aria-label="Expand"], td[aria-label="Collapse"]');
+                                return Math.max(0, Number(cell?.getAttribute('aria-colindex') || 1) - 1);
+                            };
+                            const grid = document.querySelectorAll('main .dx-datagrid')[gridIndex];
+                            if (!grid) return '';
+                            for (const row of grid.querySelectorAll('tr.dx-group-row')) {
+                                if (rowLevel(row) === 0 && (row.innerText || '').trim()) {
+                                    return (row.innerText || '').trim();
+                                }
+                            }
+                            return '';
+                        }""",
+                        grid_index,
+                    )
+                    if top_category in EXCLUDED_TOP_CATEGORIES:
+                        continue
+                    if top_category:
+                        included_top_categories.add(top_category)
+
+                    visited_pages: set[str] = set()
+                    current_path: list[str] = []
+                    while True:
+                        for _ in range(500):
+                            expanded_path = page.evaluate(
+                                """(gridIndex) => {
+                                    const rowLevel = (row) => {
+                                        const cell = row.querySelector('td[aria-label="Expand"], td[aria-label="Collapse"]');
+                                        return Math.max(0, Number(cell?.getAttribute('aria-colindex') || 1) - 1);
+                                    };
+                                    const grid = document.querySelectorAll('main .dx-datagrid')[gridIndex];
+                                    if (!grid) return null;
+                                    const path = [];
+                                    for (const row of grid.querySelectorAll('tr.dx-group-row')) {
+                                        const name = (row.innerText || '').trim();
+                                        if (!name) continue;
+                                        const level = rowLevel(row);
+                                        path.length = level;
+                                        path[level] = name;
+                                        if (row.getAttribute('aria-expanded') === 'false') {
+                                            (row.querySelector('p') || row).click();
+                                            return path.join(' / ');
+                                        }
+                                    }
+                                    return null;
+                                }""",
+                                grid_index,
+                            )
+                            if expanded_path is None:
+                                break
+                            page.wait_for_timeout(60)
+                        else:
+                            raise MonitorError("A single MDOT grid exceeded the safe 500-folder expansion limit")
+
+                        page_inventory = page.evaluate(
+                            """({gridIndex, initialPath}) => {
+                                const rowLevel = (row) => {
+                                    const cell = row.querySelector('td[aria-label="Expand"], td[aria-label="Collapse"]');
+                                    return Math.max(0, Number(cell?.getAttribute('aria-colindex') || 1) - 1);
+                                };
+                                const grid = document.querySelectorAll('main .dx-datagrid')[gridIndex];
+                                const path = [...initialPath];
+                                const folders = [];
+                                const links = [];
+                                if (!grid) return {folders, links, endPath:path, currentPage:'1', pages:['1']};
+                                for (const row of grid.querySelectorAll('tr')) {
+                                    if (row.classList.contains('dx-group-row')) {
+                                        const name = (row.innerText || '').trim();
+                                        if (!name) continue;
+                                        const level = rowLevel(row);
+                                        path.length = level;
+                                        path[level] = name;
+                                        folders.push(path.join(' / '));
+                                    } else if (row.classList.contains('dx-data-row')) {
+                                        const folderPath = path.join(' / ');
+                                        for (const anchor of row.querySelectorAll('a[href]')) {
+                                            links.push({
+                                                url: anchor.href,
+                                                title: (anchor.innerText || '').trim(),
+                                                section: folderPath,
+                                            });
+                                        }
+                                    }
+                                }
+                                const pageButtons = [...grid.querySelectorAll('.dx-page[aria-label^="Page "]')];
+                                const selected = pageButtons.find(button => button.getAttribute('aria-current') === 'page');
+                                return {
+                                    folders,
+                                    links,
+                                    endPath:path,
+                                    currentPage:selected ? (selected.innerText || '').trim() : '1',
+                                    pages:pageButtons.map(button => (button.innerText || '').trim()).filter(Boolean),
+                                };
+                            }""",
+                            {"gridIndex": grid_index, "initialPath": current_path},
+                        )
+                        current_path = list(page_inventory["endPath"])
+                        folders.update(path for path in page_inventory["folders"] if path)
+                        for item in page_inventory["links"]:
+                            key = (item["url"], item["title"], item["section"])
+                            folder_links[key] = item
+                        visited_pages.add(str(page_inventory["currentPage"]))
+                        next_page = next(
+                            (str(value) for value in page_inventory["pages"] if str(value) not in visited_pages),
+                            None,
+                        )
+                        if next_page is None:
+                            break
+                        grid = page.locator("main .dx-datagrid").nth(grid_index)
+                        grid.locator(f'.dx-page[aria-label="Page {next_page}"]').click()
+                        page.wait_for_timeout(150)
+
+                valid_folders = {
+                    path
+                    for path in folders
+                    if path.split(" / ", 1)[0] in included_top_categories
+                    and all(part.strip() for part in path.split(" / "))
+                }
+                normalized_folder_links: dict[tuple[str, str, str], dict[str, str]] = {}
+                for item in folder_links.values():
+                    parts = urlsplit(item["url"])
+                    path_parts = [part for part in unquote(parts.path).split("/") if part]
+                    if (
+                        parts.hostname in {"mdot.ms.gov", "www.mdot.ms.gov"}
+                        and len(path_parts) >= 3
+                        and path_parts[0].casefold() == "documents"
+                    ):
+                        folder_parts = path_parts[1:-1]
+                        item["section"] = " / ".join(folder_parts)
+                        for length in range(1, len(folder_parts) + 1):
+                            valid_folders.add(" / ".join(folder_parts[:length]))
+                    key = (item["url"], item["title"], item["section"])
+                    normalized_folder_links[key] = item
+                inventory = {
+                    "folders": sorted(valid_folders, key=str.casefold),
+                    "links": list(normalized_folder_links.values()),
+                }
+                page.evaluate(
+                    """(inventory) => {
+                        const main = document.querySelector('main');
+                        if (!main) return;
+                        const table = document.createElement('table');
+                        table.setAttribute('data-mdot-monitor-inventory', 'true');
+                        const body = document.createElement('tbody');
+                        table.appendChild(body);
+                        for (const path of inventory.folders) {
+                            const row = document.createElement('tr');
+                            row.setAttribute('data-mdot-folder-path', path);
+                            const cell = document.createElement('td');
+                            cell.textContent = path;
+                            row.appendChild(cell);
+                            body.appendChild(row);
+                        }
+                        for (const item of inventory.links) {
+                            const row = document.createElement('tr');
+                            row.className = 'dx-data-row';
+                            const cell = document.createElement('td');
+                            const anchor = document.createElement('a');
+                            anchor.href = item.url;
+                            anchor.textContent = item.title;
+                            anchor.setAttribute('data-mdot-folder-path', item.section);
+                            cell.appendChild(anchor);
+                            row.appendChild(cell);
+                            body.appendChild(row);
+                        }
+                        for (const grid of [...main.querySelectorAll('.dx-datagrid')]) grid.remove();
+                        main.appendChild(table);
+                    }""",
+                    inventory,
+                )
+                rendered_html = page.content()
+                if not inventory["folders"] or not inventory["links"]:
+                    raise MonitorError("Chrome rendered the MDOT page but did not expose its folder documents")
+                return rendered_html
+            finally:
+                browser.close()
+    except PlaywrightTimeoutError as exc:
+        raise MonitorError(f"Chrome did not finish rendering within {timeout_seconds} seconds") from exc
+    except MonitorError:
+        raise
+    except Exception as exc:
+        raise MonitorError(f"Chrome could not render and expand the MDOT folder tree: {exc}") from exc
 
 
 def hash_stream(stream: BinaryIO, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
@@ -563,7 +784,14 @@ def build_snapshot(
 ) -> dict[str, object]:
     rendered = render_page(page_url)
     page = parse_rendered_page(rendered, page_url)
-    document_links = [item for item in page["links"] if is_mdot_document(item["url"])]
+    document_by_url: dict[str, dict[str, str]] = {}
+    for item in page["links"]:
+        if not is_mdot_document(item["url"]) or is_excluded_document(item):
+            continue
+        current = document_by_url.get(item["url"])
+        if current is None or (not current.get("section") and item.get("section")):
+            document_by_url[item["url"]] = item
+    document_links = list(document_by_url.values())
     known_urls = {item["url"] for item in document_links}
     for extra in extra_documents or []:
         extra_url = canonicalize_url(page_url, str(extra["url"]))
@@ -623,10 +851,11 @@ def build_snapshot(
             temp_path.unlink(missing_ok=True)
     documents.sort(key=lambda item: item["url"].casefold())
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "page_url": page_url,
         "page_text": page["text"],
+        "folders": page.get("folders", []),
         "links": filtered_page_links,
         "documents": documents,
     }
@@ -816,8 +1045,17 @@ def describe_page_text_changes(old_text: str, new_text: str) -> list[str]:
 
 
 def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[str, object]:
-    old_docs = {item.get("identity", item["url"]): item for item in old.get("documents", [])}
-    new_docs = {item.get("identity", item["url"]): item for item in new.get("documents", [])}
+    folder_crawl_migration = int(old.get("schema_version", 1)) < 2 <= int(new.get("schema_version", 1))
+    old_docs = {
+        item.get("identity", item["url"]): item
+        for item in old.get("documents", [])
+        if not is_excluded_document(item)
+    }
+    new_docs = {
+        item.get("identity", item["url"]): item
+        for item in new.get("documents", [])
+        if not is_excluded_document(item)
+    }
     added_urls = set(new_docs) - set(old_docs)
     removed_urls = set(old_docs) - set(new_docs)
     moved: list[dict[str, object]] = []
@@ -856,7 +1094,11 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
     ]
 
     def link_map(snapshot: dict[str, object]) -> dict[str, dict[str, object]]:
-        return {item["url"]: item for item in snapshot.get("links", [])}
+        return {
+            item["url"]: item
+            for item in snapshot.get("links", [])
+            if not is_excluded_document(item)
+        }
 
     old_links, new_links = link_map(old), link_map(new)
     link_added = [new_links[url] for url in sorted(set(new_links) - set(old_links))]
@@ -871,19 +1113,26 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
         for url in sorted(set(old_links) & set(new_links))
         if old_links[url].get("title", "") != new_links[url].get("title", "")
     ]
+    old_folders = {item["path"]: item for item in old.get("folders", [])}
+    new_folders = {item["path"]: item for item in new.get("folders", [])}
+    compare_folders = "folders" in old and "folders" in new
     return {
-        "page_text_changed": old.get("page_text") != new.get("page_text"),
-        "page_text_details": describe_page_text_changes(
+        "page_text_changed": False if folder_crawl_migration else old.get("page_text") != new.get("page_text"),
+        "page_text_details": [] if folder_crawl_migration else describe_page_text_changes(
             str(old.get("page_text", "")),
             str(new.get("page_text", "")),
         ),
-        "documents_added": [new_docs[url] for url in sorted(added_urls)],
+        "documents_added": [] if folder_crawl_migration else [new_docs[url] for url in sorted(added_urls)],
         "documents_removed": [old_docs[url] for url in sorted(removed_urls)],
         "documents_modified": modified,
         "documents_renamed": renamed,
         "documents_relinked": relinked,
         "documents_moved": moved,
-        "links_added": link_added,
+        "folders_added": [new_folders[path] for path in sorted(set(new_folders) - set(old_folders))]
+        if compare_folders and not folder_crawl_migration else [],
+        "folders_removed": [old_folders[path] for path in sorted(set(old_folders) - set(new_folders))]
+        if compare_folders and not folder_crawl_migration else [],
+        "links_added": [] if folder_crawl_migration else link_added,
         "links_removed": link_removed,
         "links_renamed": link_renamed,
     }
@@ -1070,6 +1319,8 @@ def format_change_email(
     add_section("Documents added", changes["documents_added"], lambda x: link(x["url"], x["title"]))
     add_section("Documents removed", changes["documents_removed"], lambda x: e(str(x["title"])))
     add_section("Document contents modified", changes["documents_modified"], modified_document)
+    add_section("Folders added", changes.get("folders_added", []), lambda x: e(str(x["path"])))
+    add_section("Folders removed", changes.get("folders_removed", []), lambda x: e(str(x["path"])))
     add_section(
         "Documents renamed",
         changes["documents_renamed"],
@@ -1217,6 +1468,8 @@ def summarize_changes(changes: dict[str, object]) -> list[str]:
     if changes.get("page_text_changed"):
         lines.append("Visible page content changed")
     labels = (
+        ("folders_added", "folder(s) added"),
+        ("folders_removed", "folder(s) removed"),
         ("documents_added", "document(s) added"),
         ("documents_removed", "document(s) removed"),
         ("documents_modified", "document(s) modified"),
