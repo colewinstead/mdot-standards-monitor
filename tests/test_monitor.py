@@ -554,6 +554,50 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(2, downloader.call_count)
         self.assertEqual(1, len(result["documents"]))
 
+    def test_snapshot_retains_last_good_document_after_all_retries_fail(self):
+        item = {
+            "url": "https://mdot.ms.gov/documents/document.pdf",
+            "title": "Training",
+            "section": "Dynamic",
+            "identity": "dynamic:Training",
+        }
+        previous = dict(item, sha256="last-good", size=123, analysis={"kind": "lines", "lines": ["known"]})
+        page = {"text": "Standards", "folders": [], "links": [item]}
+        with mock.patch("monitor.render_page", return_value="rendered") as renderer, \
+             mock.patch("monitor.parse_rendered_page", return_value=page), \
+             mock.patch("monitor.download_document", side_effect=monitor.MonitorError("HTTP Error 504")) as downloader, \
+             mock.patch("monitor.time.sleep"):
+            result = monitor.build_snapshot(
+                monitor.DEFAULT_URL,
+                mock.Mock(),
+                previous_snapshot=snapshot(documents=[previous]),
+                store_previews=False,
+                retry_attempts=3,
+                retry_delay_seconds=0,
+            )
+        self.assertEqual(1, renderer.call_count)
+        self.assertEqual(3, downloader.call_count)
+        self.assertEqual("last-good", result["documents"][0]["sha256"])
+        self.assertEqual("Training", result["document_errors"][0]["title"])
+
+    def test_document_warning_goes_only_to_failure_recipient(self):
+        added = document("https://mdot.ms.gov/documents/new.pdf", "New standard", "new")
+        current = snapshot(documents=[added])
+        current.update({"generated_at": "now", "page_url": monitor.DEFAULT_URL})
+        current["document_errors"] = [{"title": "Training", "error": "HTTP Error 504"}]
+        config = {"failure_recipient": "owner@example.com", "page_url": monitor.DEFAULT_URL}
+        with mock.patch("monitor.send_outlook") as sender:
+            monitor.notify_document_errors(current, config, mock.Mock())
+        sender.assert_called_once()
+        self.assertEqual(["owner@example.com"], sender.call_args.args[2])
+        self.assertIn("HTTP Error 504", sender.call_args.args[1])
+        team_body = monitor.format_change_email(
+            monitor.compare_snapshots(snapshot(), current),
+            current,
+        )
+        self.assertIn("New standard", team_body)
+        self.assertNotIn("HTTP Error 504", team_body)
+
     def test_document_filters_match_section_title_and_extension(self):
         item = {
             "title": "Bridge Design Manual",

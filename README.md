@@ -8,6 +8,8 @@ For modified files, the report also identifies PDF page numbers and text excerpt
 
 Temporary rendering or download failures are retried with exponential backoff. Retries are scoped to the failed page render, dynamic link resolution, or individual document, so one unavailable file does not restart every completed download. A detected change is checked a second time after two minutes before anyone is notified. The monitor also keeps a local change-history dashboard and sends a quiet weekly health summary so the team knows monitoring is still operational.
 
+If one document remains unavailable after all retries, the monitor retains its last good snapshot and continues checking and reporting changes in every other document. The configured failure recipient receives a separate private warning; document errors are never included in the team change email.
+
 ## Install
 
 1. Confirm Classic Outlook has a working signed-in profile. Chrome and Outlook may remain open during checks.

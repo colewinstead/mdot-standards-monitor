@@ -808,6 +808,15 @@ def build_snapshot(
             document_by_url[item["url"]] = item
     document_links = list(document_by_url.values())
     known_urls = {item["url"] for item in document_links}
+    previous_documents = {
+        item.get("identity", item["url"]): item
+        for item in (previous_snapshot or {}).get("documents", [])
+    }
+    previous_by_url = {
+        item["url"]: item for item in (previous_snapshot or {}).get("documents", [])
+    }
+    document_errors: list[dict[str, str]] = []
+    carried_documents: list[dict[str, object]] = []
     for extra in extra_documents or []:
         extra_url = canonicalize_url(page_url, str(extra["url"]))
         if extra_url not in known_urls:
@@ -821,13 +830,22 @@ def build_snapshot(
             known_urls.add(extra_url)
     for rule in dynamic_documents or []:
         dynamic_title = normalize_text(str(rule.get("title", "dynamic document")))
-        resolved = retry_operation(
-            lambda rule=rule: resolve_dynamic_document(rule),
-            retry_attempts,
-            retry_delay_seconds,
-            logger,
-            f"Dynamic document resolution: {dynamic_title}",
-        )
+        try:
+            resolved = retry_operation(
+                lambda rule=rule: resolve_dynamic_document(rule),
+                retry_attempts,
+                retry_delay_seconds,
+                logger,
+                f"Dynamic document resolution: {dynamic_title}",
+            )
+        except Exception as exc:
+            error = normalize_text(str(exc)) or type(exc).__name__
+            logger.error("Could not resolve %s after all retries; continuing: %s", dynamic_title, error)
+            document_errors.append({"title": dynamic_title, "url": str(rule.get("source_url", "")), "error": error})
+            previous = previous_documents.get("dynamic:" + dynamic_title)
+            if previous and item_matches_filters(previous, filters):
+                carried_documents.append(dict(previous))
+            continue
         if resolved["url"] not in known_urls:
             document_links.append(resolved)
             known_urls.add(resolved["url"])
@@ -838,26 +856,27 @@ def build_snapshot(
         if item_matches_filters(item, {"sections": normalize_filters(filters)["sections"], "titles": normalize_filters(filters)["titles"]})
     ]
     logger.info("Rendered page with %d links and %d monitored documents", len(page["links"]), len(document_links))
-    previous_documents = {
-        item.get("identity", item["url"]): item
-        for item in (previous_snapshot or {}).get("documents", [])
-    }
-    previous_by_url = {
-        item["url"]: item for item in (previous_snapshot or {}).get("documents", [])
-    }
-    documents = []
+    documents = carried_documents
     for index, item in enumerate(document_links, start=1):
         logger.info("Hashing document %d/%d: %s", index, len(document_links), item["title"])
-        downloaded = retry_operation(
-            lambda item=item: download_document(item),
-            retry_attempts,
-            retry_delay_seconds,
-            logger,
-            f"Document {index}/{len(document_links)}: {item['title']}",
-        )
+        previous = previous_documents.get(item.get("identity", item["url"])) or previous_by_url.get(item["url"])
+        try:
+            downloaded = retry_operation(
+                lambda item=item: download_document(item),
+                retry_attempts,
+                retry_delay_seconds,
+                logger,
+                f"Document {index}/{len(document_links)}: {item['title']}",
+            )
+        except Exception as exc:
+            error = normalize_text(str(exc)) or type(exc).__name__
+            logger.error("Could not hash %s after all retries; continuing: %s", item["title"], error)
+            document_errors.append({"title": item["title"], "url": item["url"], "error": error})
+            if previous:
+                documents.append(dict(previous))
+            continue
         temp_path = Path(str(downloaded.pop("_temp_path")))
         try:
-            previous = previous_documents.get(item.get("identity", item["url"])) or previous_by_url.get(item["url"])
             if (
                 not force_analysis
                 and previous
@@ -886,6 +905,7 @@ def build_snapshot(
         "folders": page.get("folders", []),
         "links": filtered_page_links,
         "documents": documents,
+        "document_errors": document_errors,
     }
 
 
@@ -1746,6 +1766,41 @@ def record_failure(error: Exception, config: dict[str, object], logger: logging.
     atomic_write_json(RUNTIME_FILE, runtime)
 
 
+def notify_document_errors(
+    snapshot: dict[str, object],
+    config: dict[str, object],
+    logger: logging.Logger,
+) -> None:
+    """Privately report unavailable documents without failing an otherwise valid check."""
+    errors = list(snapshot.get("document_errors", []))
+    if not errors:
+        return
+    recipient = str(config.get("failure_recipient", "")).strip()
+    if not recipient:
+        logger.warning("%d document warning(s) were logged, but no failure recipient is configured", len(errors))
+        return
+    details = " | ".join(
+        f"{normalize_text(str(item.get('title', 'Document')))}: {normalize_text(str(item.get('error', 'Unavailable')))}"
+        for item in errors
+    )
+    if len(details) > 3500:
+        details = details[:3499] + "…"
+    message = (
+        f"The check continued after {len(errors)} document(s) could not be loaded. "
+        "Their last known snapshots were retained when available, and other MDOT changes were processed normally. "
+        f"Details: {details}"
+    )
+    try:
+        send_outlook(
+            "[MDOT Standards] Document download warning",
+            format_status_email("MDOT document download warning", message, str(config.get("page_url", DEFAULT_URL))),
+            [recipient],
+        )
+        logger.info("Sent document warning to the configured failure recipient")
+    except Exception as notification_error:
+        logger.error("Could not send the document warning: %s", notification_error)
+
+
 def clear_failure_state(config: dict[str, object], logger: logging.Logger) -> None:
     runtime = load_runtime()
     runtime["consecutive_failures"] = 0
@@ -1820,6 +1875,7 @@ def run_check(args: argparse.Namespace) -> int:
 
             if args.initialize or baseline is None:
                 atomic_write_json(STATE_FILE, snapshot)
+                notify_document_errors(snapshot, config, logger)
                 save_success_runtime(runtime, snapshot, started)
                 cleanup_preview_cache(snapshot)
                 logger.info("Baseline initialized with %d documents; no update email sent", len(snapshot["documents"]))
@@ -1836,7 +1892,7 @@ def run_check(args: argparse.Namespace) -> int:
                     # Start the weekly interval without surprising an upgraded installation
                     # with an immediate health email on its first successful run.
                     runtime["last_heartbeat_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-                elif heartbeat_is_due(runtime, float(config["heartbeat_days"])):
+                elif not snapshot.get("document_errors") and heartbeat_is_due(runtime, float(config["heartbeat_days"])):
                     heartbeat_recipient = str(config.get("failure_recipient", "")).strip()
                     if heartbeat_recipient:
                         send_outlook(
@@ -1857,6 +1913,7 @@ def run_check(args: argparse.Namespace) -> int:
                         )
                     else:
                         logger.warning("Weekly health summary was due, but no failure recipient is configured")
+                notify_document_errors(snapshot, config, logger)
                 save_success_runtime(runtime, snapshot, started)
                 cleanup_preview_cache(snapshot)
                 logger.info("No MDOT updates detected")
@@ -1876,6 +1933,7 @@ def run_check(args: argparse.Namespace) -> int:
                         ["The first check detected a change, but the confirmation check returned to the baseline."],
                         int(config["history_limit"]),
                     )
+                    notify_document_errors(confirmed_snapshot, config, logger)
                     save_success_runtime(runtime, confirmed_snapshot, started)
                     cleanup_preview_cache(confirmed_snapshot)
                     logger.info("Suppressed a transient change that did not survive confirmation")
@@ -1907,6 +1965,7 @@ def run_check(args: argparse.Namespace) -> int:
                 changes,
                 snapshot,
             )
+            notify_document_errors(snapshot, config, logger)
             save_success_runtime(runtime, snapshot, started, change_count(changes))
             cleanup_preview_cache(snapshot)
             return 0
