@@ -6,7 +6,7 @@ The website sections **Construction** and **Construction Materials** (the latter
 
 For modified files, the report also identifies PDF page numbers and text excerpts, Word paragraph changes, Excel sheet/cell changes, and text-file line changes. Modified PDF pages include low-resolution before/after previews, including drawings and scanned pages with no extractable text.
 
-Temporary rendering or download failures are retried with exponential backoff. A detected change is checked a second time after two minutes before anyone is notified. The monitor also keeps a local change-history dashboard and sends a quiet weekly health summary so the team knows monitoring is still operational.
+Temporary rendering or download failures are retried with exponential backoff. Retries are scoped to the failed page render, dynamic link resolution, or individual document, so one unavailable file does not restart every completed download. A detected change is checked a second time after two minutes before anyone is notified. The monitor also keeps a local change-history dashboard and sends a quiet weekly health summary so the team knows monitoring is still operational.
 
 ## Install
 

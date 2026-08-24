@@ -147,17 +147,24 @@ def normalize_text(value: str) -> str:
 
 
 def retry_operation(operation, attempts: int, delay_seconds: float, logger: logging.Logger, label: str):
-    """Retry a complete network/render operation without hiding the final error."""
+    """Retry one network/render operation without hiding the final error."""
     attempts = max(1, int(attempts))
     delay_seconds = max(0.0, float(delay_seconds))
     for attempt in range(1, attempts + 1):
         try:
             return operation()
-        except Exception:
+        except Exception as exc:
             if attempt >= attempts:
                 raise
             wait = delay_seconds * (2 ** (attempt - 1))
-            logger.warning("%s failed on attempt %d/%d; retrying in %.1f seconds", label, attempt, attempts, wait)
+            logger.warning(
+                "%s failed on attempt %d/%d (%s); retrying in %.1f seconds",
+                label,
+                attempt,
+                attempts,
+                normalize_text(str(exc)) or type(exc).__name__,
+                wait,
+            )
             time.sleep(wait)
 
 
@@ -781,8 +788,16 @@ def build_snapshot(
     filters: dict[str, object] | None = None,
     store_previews: bool = True,
     preview_root: Path | None = None,
+    retry_attempts: int = 1,
+    retry_delay_seconds: float = 0.0,
 ) -> dict[str, object]:
-    rendered = render_page(page_url)
+    rendered = retry_operation(
+        lambda: render_page(page_url),
+        retry_attempts,
+        retry_delay_seconds,
+        logger,
+        "MDOT page render",
+    )
     page = parse_rendered_page(rendered, page_url)
     document_by_url: dict[str, dict[str, str]] = {}
     for item in page["links"]:
@@ -805,7 +820,14 @@ def build_snapshot(
             )
             known_urls.add(extra_url)
     for rule in dynamic_documents or []:
-        resolved = resolve_dynamic_document(rule)
+        dynamic_title = normalize_text(str(rule.get("title", "dynamic document")))
+        resolved = retry_operation(
+            lambda rule=rule: resolve_dynamic_document(rule),
+            retry_attempts,
+            retry_delay_seconds,
+            logger,
+            f"Dynamic document resolution: {dynamic_title}",
+        )
         if resolved["url"] not in known_urls:
             document_links.append(resolved)
             known_urls.add(resolved["url"])
@@ -826,7 +848,13 @@ def build_snapshot(
     documents = []
     for index, item in enumerate(document_links, start=1):
         logger.info("Hashing document %d/%d: %s", index, len(document_links), item["title"])
-        downloaded = download_document(item)
+        downloaded = retry_operation(
+            lambda item=item: download_document(item),
+            retry_attempts,
+            retry_delay_seconds,
+            logger,
+            f"Document {index}/{len(document_links)}: {item['title']}",
+        )
         temp_path = Path(str(downloaded.pop("_temp_path")))
         try:
             previous = previous_documents.get(item.get("identity", item["url"])) or previous_by_url.get(item["url"])
@@ -1776,15 +1804,11 @@ def run_check(args: argparse.Namespace) -> int:
                     dynamic_documents=list(config.get("dynamic_documents", [])),
                     filters=dict(config.get("filters", {})),
                     store_previews=not args.dry_run,
+                    retry_attempts=int(config["retry_attempts"]),
+                    retry_delay_seconds=float(config["retry_delay_seconds"]),
                 )
 
-            snapshot = retry_operation(
-                create_snapshot,
-                int(config["retry_attempts"]),
-                float(config["retry_delay_seconds"]),
-                logger,
-                "MDOT snapshot",
-            )
+            snapshot = create_snapshot()
             if args.dry_run:
                 if baseline:
                     changes = compare_snapshots(baseline, snapshot)
@@ -1842,13 +1866,7 @@ def run_check(args: argparse.Namespace) -> int:
             if confirmation_delay > 0 and not getattr(args, "no_confirm", False):
                 logger.info("Waiting %.1f seconds before confirming detected changes", confirmation_delay)
                 time.sleep(confirmation_delay)
-                confirmed_snapshot = retry_operation(
-                    create_snapshot,
-                    int(config["retry_attempts"]),
-                    float(config["retry_delay_seconds"]),
-                    logger,
-                    "MDOT confirmation snapshot",
-                )
+                confirmed_snapshot = create_snapshot()
                 confirmed_changes = compare_snapshots(baseline, confirmed_snapshot)
                 if not has_changes(confirmed_changes):
                     atomic_write_json(STATE_FILE, confirmed_snapshot)

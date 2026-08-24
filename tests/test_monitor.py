@@ -508,10 +508,51 @@ class FeatureTests(unittest.TestCase):
 
     def test_retry_operation_recovers_from_temporary_failure(self):
         operation = mock.Mock(side_effect=[monitor.MonitorError("temporary"), "ok"])
+        logger = mock.Mock()
         with mock.patch("monitor.time.sleep") as sleeper:
-            result = monitor.retry_operation(operation, 3, 2, mock.Mock(), "test")
+            result = monitor.retry_operation(operation, 3, 2, logger, "test")
         self.assertEqual("ok", result)
         sleeper.assert_called_once_with(2)
+        self.assertIn("temporary", logger.warning.call_args.args)
+
+    def test_snapshot_retries_only_the_failed_document(self):
+        page = {
+            "text": "Standards",
+            "folders": [],
+            "links": [{
+                "url": "https://mdot.ms.gov/documents/a.pdf",
+                "title": "A",
+                "section": "Manuals",
+            }],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            downloaded_path = Path(directory) / "a.pdf"
+            downloaded_path.write_bytes(b"pdf")
+            downloaded = {
+                "url": page["links"][0]["url"],
+                "title": "A",
+                "section": "Manuals",
+                "sha256": "digest",
+                "size": 3,
+                "content_type": "application/pdf",
+                "content_disposition": "",
+                "_temp_path": str(downloaded_path),
+            }
+            with mock.patch("monitor.render_page", return_value="rendered") as renderer, \
+                 mock.patch("monitor.parse_rendered_page", return_value=page), \
+                 mock.patch("monitor.download_document", side_effect=[monitor.MonitorError("timeout"), downloaded]) as downloader, \
+                 mock.patch("monitor.analyze_document", return_value={"kind": "lines", "lines": []}), \
+                 mock.patch("monitor.time.sleep"):
+                result = monitor.build_snapshot(
+                    monitor.DEFAULT_URL,
+                    mock.Mock(),
+                    store_previews=False,
+                    retry_attempts=3,
+                    retry_delay_seconds=0,
+                )
+        self.assertEqual(1, renderer.call_count)
+        self.assertEqual(2, downloader.call_count)
+        self.assertEqual(1, len(result["documents"]))
 
     def test_document_filters_match_section_title_and_extension(self):
         item = {
