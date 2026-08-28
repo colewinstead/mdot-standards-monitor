@@ -316,6 +316,41 @@ class DetailedComparisonTests(unittest.TestCase):
         self.assertIn("Page 7 changed", body)
         self.assertIn("revised value", body)
 
+    def test_sqs_email_consolidates_duplicate_library_variants(self):
+        old_lines = [
+            "1|804-E001 |40' Prestressed Concrete Voided Slab |EA |STRUCTURES",
+        ]
+        new_lines = [
+            "1|804-C278 |65' Prestressed Concrete Beam, Type FIB-36 |LF |STRUCTURES",
+            "2|804-E001 |40' Prestressed Concrete Voided Slab |EA |STRUCTURES",
+        ]
+
+        def sqs_document(title, lines, digest):
+            item = document(
+                f"https://mdot.ms.gov/documents/Roadway%20Design/Standards/PayItems/{title}.txt",
+                title,
+                digest,
+            )
+            item["analysis"] = {"kind": "lines", "lines": lines}
+            return item
+
+        old = snapshot(documents=[
+            sqs_document("sqs-daily-english-17", old_lines, "old-17"),
+            sqs_document("sqs-daily-english", old_lines * 2, "old-all"),
+        ])
+        new = snapshot(documents=[
+            sqs_document("sqs-daily-english-17", new_lines, "new-17"),
+            sqs_document("sqs-daily-english", new_lines * 2, "new-all"),
+        ])
+        changes = monitor.compare_snapshots(old, new)
+        new.update({"generated_at": "now", "page_url": monitor.DEFAULT_URL})
+        body = monitor.format_change_email(changes, new)
+        self.assertIn("SQS pay item library", body)
+        self.assertIn("804-C278", body)
+        self.assertIn("65&#x27; Prestressed Concrete Beam", body)
+        self.assertEqual(1, body.count(">ADDED<"))
+        self.assertNotIn("Line(s)", body)
+
     def test_page_text_email_shows_old_and_new_wording(self):
         old = snapshot(text="Design manual effective January 2025")
         new = snapshot(text="Design manual effective July 2026")

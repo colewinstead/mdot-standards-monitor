@@ -1028,6 +1028,57 @@ def describe_sequence_changes(
     return details[:20] + ([f"{len(details) - 20} additional change group(s) omitted"] if len(details) > 20 else [])
 
 
+def parse_sqs_pay_item(line: str) -> dict[str, str] | None:
+    """Parse one pipe-delimited SQS library row, ignoring its shifting row number."""
+    parts = [part.strip() for part in line.split("|")]
+    if len(parts) < 5 or not parts[0].isdigit() or not parts[1]:
+        return None
+    return {
+        "code": parts[1],
+        "description": parts[2],
+        "unit": parts[3],
+        "category": " | ".join(part for part in parts[4:] if part),
+    }
+
+
+def sqs_pay_items(analysis: dict[str, object]) -> dict[str, dict[str, str]]:
+    items: dict[str, dict[str, str]] = {}
+    for line in analysis.get("lines", []):
+        item = parse_sqs_pay_item(str(line))
+        if item is None:
+            continue
+        current = items.get(item["code"])
+        # The combined English library can contain repeated or truncated copies.
+        # Retain the most complete representation of each pay-item code.
+        if current is None or sum(map(len, item.values())) > sum(map(len, current.values())):
+            items[item["code"]] = item
+    return items
+
+
+def compare_sqs_pay_items(
+    old_analysis: dict[str, object],
+    new_analysis: dict[str, object],
+) -> dict[str, list[dict[str, str]]]:
+    old_items = sqs_pay_items(old_analysis)
+    new_items = sqs_pay_items(new_analysis)
+    return {
+        "added": [new_items[code] for code in sorted(set(new_items) - set(old_items))],
+        "removed": [old_items[code] for code in sorted(set(old_items) - set(new_items))],
+        "updated": [
+            {**new_items[code], "old_description": old_items[code]["description"],
+             "old_unit": old_items[code]["unit"], "old_category": old_items[code]["category"]}
+            for code in sorted(set(old_items) & set(new_items))
+            if old_items[code] != new_items[code]
+        ],
+    }
+
+
+def is_sqs_pay_item_document(document: dict[str, object]) -> bool:
+    title = str(document.get("title", "")).casefold()
+    url = unquote(urlsplit(str(document.get("url", ""))).path).casefold()
+    return title.startswith("sqs-daily-") or "/payitems/sqs-daily-" in url
+
+
 def describe_excel_changes(old: dict[str, object], new: dict[str, object]) -> list[str]:
     def cells(analysis: dict[str, object]) -> dict[tuple[str, str], str]:
         return {
@@ -1364,9 +1415,87 @@ def format_change_email(
             )
         return f'{link(new_document["url"], new_document["title"])}{detail_html}{preview_html}'
 
+    sqs_documents = [
+        item for item in changes["documents_modified"]
+        if is_sqs_pay_item_document(item["new"])
+    ]
+    if sqs_documents:
+        consolidated: dict[tuple[str, str], dict[str, str]] = {}
+        for document_change in sqs_documents:
+            pay_item_changes = compare_sqs_pay_items(
+                document_change["old"].get("analysis") or {},
+                document_change["new"].get("analysis") or {},
+            )
+            for change_kind, pay_items in pay_item_changes.items():
+                for pay_item in pay_items:
+                    consolidated[(change_kind, pay_item["code"])] = pay_item
+
+        badge_styles = {
+            "added": ("ADDED", "#e7f6ec", "#176b3a"),
+            "removed": ("REMOVED", "#fdecec", "#9b2c2c"),
+            "updated": ("UPDATED", "#e8f2f7", "#176b87"),
+        }
+
+        def pay_item_row(entry: tuple[tuple[str, str], dict[str, str]]) -> str:
+            (change_kind, _), pay_item = entry
+            badge, badge_background, badge_color = badge_styles[change_kind]
+            previous = ""
+            if change_kind == "updated":
+                old_summary = " · ".join(
+                    value for value in (
+                        pay_item.get("old_description", ""),
+                        pay_item.get("old_unit", ""),
+                        pay_item.get("old_category", ""),
+                    ) if value
+                )
+                previous = (
+                    '<div style="padding-top:4px;font-size:12px;line-height:17px;color:#71818c;">'
+                    f'Previously: {e(old_summary)}</div>'
+                )
+            metadata = " &nbsp;&bull;&nbsp; ".join(
+                e(value) for value in (pay_item["unit"], pay_item["category"]) if value
+            )
+            return (
+                '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+                '<tr><td valign="top" width="82" style="padding-right:10px;">'
+                f'<span style="display:inline-block;padding:3px 7px;background-color:{badge_background};'
+                f'color:{badge_color};font-size:10px;line-height:14px;font-weight:700;letter-spacing:.4px;">'
+                f'{badge}</span></td><td valign="top">'
+                f'<div style="font-size:14px;line-height:20px;color:#253746;"><strong>{e(pay_item["code"])}</strong>'
+                f' &mdash; {e(pay_item["description"])}</div>'
+                f'<div style="padding-top:2px;font-size:12px;line-height:17px;color:#526675;">{metadata}</div>'
+                f'{previous}</td></tr></table>'
+            )
+
+        if consolidated:
+            sorted_pay_items = sorted(consolidated.items(), key=lambda entry: (entry[0][0], entry[0][1]))
+            affected_links = " &nbsp;&bull;&nbsp; ".join(
+                link(item["new"]["url"], item["new"]["title"])
+                for item in sqs_documents
+            )
+            sections.append(
+                '<tr><td style="padding:0 28px 16px 28px;">'
+                '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+                'style="border:1px solid #d7e0e5;border-collapse:separate;">'
+                '<tr><td style="padding:12px 16px;background-color:#f2f6f8;border-bottom:1px solid #d7e0e5;'
+                'font-family:Segoe UI,Arial,sans-serif;font-size:16px;line-height:22px;font-weight:700;color:#12324a;">'
+                f'SQS pay item library <span style="font-size:12px;line-height:18px;color:#526675;font-weight:600;">'
+                f'({len(consolidated)} item change(s))</span></td></tr>'
+                '<tr><td style="padding:13px 16px 5px 16px;font-family:Segoe UI,Arial,sans-serif;">'
+                '<div style="padding-bottom:12px;font-size:12px;line-height:18px;color:#687985;">'
+                'Duplicate entries across library variants are consolidated below.</div>'
+                f'{item_rows(sorted_pay_items, pay_item_row)}'
+                '<div style="padding:2px 0 9px 0;font-size:12px;line-height:18px;color:#687985;">'
+                f'Affected files: {affected_links}</div></td></tr></table></td></tr>'
+            )
+
     add_section("Documents added", changes["documents_added"], lambda x: link(x["url"], x["title"]))
     add_section("Documents removed", changes["documents_removed"], lambda x: e(str(x["title"])))
-    add_section("Document contents modified", changes["documents_modified"], modified_document)
+    add_section(
+        "Document contents modified",
+        [item for item in changes["documents_modified"] if item not in sqs_documents],
+        modified_document,
+    )
     add_section("Folders added", changes.get("folders_added", []), lambda x: e(str(x["path"])))
     add_section("Folders removed", changes.get("folders_removed", []), lambda x: e(str(x["path"])))
     add_section(
