@@ -214,6 +214,18 @@ class ComparisonTests(unittest.TestCase):
 
 
 class DetailedComparisonTests(unittest.TestCase):
+    def test_pdf_repackaging_without_rendered_page_change_is_not_notifiable(self):
+        old = document("https://mdot.ms.gov/documents/a.pdf", "Manual", "old-hash")
+        new = document("https://mdot.ms.gov/documents/a.pdf", "Manual", "new-hash")
+        page = {"page": 1, "visual_sha256": "same-render", "text_sha256": "same-text"}
+        old["analysis"] = {"kind": "pdf_pages", "pages": [page]}
+        new["analysis"] = {"kind": "pdf_pages", "pages": [dict(page)]}
+
+        changes = monitor.compare_snapshots(snapshot(documents=[old]), snapshot(documents=[new]))
+
+        self.assertFalse(changes["documents_modified"])
+        self.assertFalse(monitor.has_changes(changes))
+
     def test_pdf_reports_changed_page_number_and_text(self):
         import pymupdf
 

@@ -1124,6 +1124,28 @@ def describe_analysis_changes(old: dict[str, object], new: dict[str, object]) ->
     return [str(new_analysis.get("reason", "Detailed internal comparison is unavailable for this file type"))]
 
 
+def is_render_only_pdf_repackaging(old: dict[str, object], new: dict[str, object]) -> bool:
+    """Return whether two PDF files differ internally but render identically.
+
+    PDF producers commonly rewrite metadata, object ordering, or compression without
+    changing a page the reader can see.  Those updates are recorded in the baseline
+    through the file hash, but they are not useful change notifications.
+    """
+    old_analysis = old.get("analysis") or {}
+    new_analysis = new.get("analysis") or {}
+    if old_analysis.get("kind") != "pdf_pages" or new_analysis.get("kind") != "pdf_pages":
+        return False
+    old_pages = list(old_analysis.get("pages", []))
+    new_pages = list(new_analysis.get("pages", []))
+    if len(old_pages) != len(new_pages):
+        return False
+    return all(
+        (old_page.get("visual_sha256") or old_page.get("text_sha256"))
+        == (new_page.get("visual_sha256") or new_page.get("text_sha256"))
+        for old_page, new_page in zip(old_pages, new_pages)
+    )
+
+
 def describe_page_text_changes(old_text: str, new_text: str) -> list[str]:
     old_words = old_text.split()
     new_words = new_text.split()
@@ -1179,7 +1201,10 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
             ),
         }
         for url in sorted(set(old_docs) & set(new_docs))
-        if old_docs[url].get("sha256") != new_docs[url].get("sha256")
+        if (
+            old_docs[url].get("sha256") != new_docs[url].get("sha256")
+            and not is_render_only_pdf_repackaging(old_docs[url], new_docs[url])
+        )
     ]
     renamed = [
         {"old": old_docs[url], "new": new_docs[url]}
