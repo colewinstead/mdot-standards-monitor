@@ -3,6 +3,7 @@ import io
 import tempfile
 import unittest
 from unittest import mock
+from email.message import Message
 from urllib.error import URLError
 import zipfile
 from pathlib import Path
@@ -64,6 +65,18 @@ class PageParsingTests(unittest.TestCase):
         )
         self.assertEqual("Roadway Design / Standards / Manuals", result["links"][0]["section"])
 
+    def test_generated_inventory_text_is_excluded_from_page_text(self):
+        source = """
+        <main><h1>Engineering standards</h1><p>Visible instructions</p>
+        <table data-mdot-monitor-inventory='true'><tr data-mdot-folder-path='Roadway'>
+        <td><a data-mdot-folder-path='Roadway' href='/documents/hidden.pdf'>Virtual-grid document</a></td>
+        </tr></table></main>
+        """
+        result = monitor.parse_rendered_page(source, monitor.DEFAULT_URL)
+        self.assertIn("Visible instructions", result["text"])
+        self.assertNotIn("Virtual-grid document", result["text"])
+        self.assertEqual("Virtual-grid document", result["links"][0]["title"])
+
 
 class HashTests(unittest.TestCase):
     def test_hash_stream(self):
@@ -76,6 +89,20 @@ class HashTests(unittest.TestCase):
         with mock.patch("monitor.urlopen", side_effect=URLError("offline")):
             with self.assertRaises(monitor.MonitorError):
                 monitor.download_document(item)
+
+    def test_html_response_for_expected_document_is_a_monitor_failure(self):
+        headers = Message()
+        headers.add_header("Content-Type", "text/html")
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers = headers
+        with mock.patch("monitor.urlopen", return_value=response):
+            with self.assertRaisesRegex(monitor.MonitorError, "Expected a .dgn file"):
+                monitor.download_document({
+                    "url": "https://mdot.ms.gov/documents/broken.dgn",
+                    "title": "Broken drawing",
+                    "section": "Roadway",
+                })
 
     def test_projectwise_download_is_identified_as_pdf_from_headers(self):
         extension = monitor.infer_document_extension(
@@ -202,6 +229,17 @@ class ComparisonTests(unittest.TestCase):
         self.assertFalse(changes["links_removed"])
         self.assertFalse(changes["links_renamed"])
         self.assertFalse(monitor.has_changes(changes))
+
+    def test_page_text_inventory_schema_upgrade_does_not_send_a_page_alert(self):
+        old = snapshot("Visible copy Virtual-grid document")
+        old["schema_version"] = 2
+        new = snapshot("Visible copy")
+        new["schema_version"] = monitor.SNAPSHOT_SCHEMA_VERSION
+
+        changes = monitor.compare_snapshots(old, new)
+
+        self.assertFalse(changes["page_text_changed"])
+        self.assertFalse(changes["page_text_details"])
 
     def test_excluded_construction_documents_do_not_appear_removed(self):
         construction = document(

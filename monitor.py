@@ -58,6 +58,7 @@ DEFAULT_CONFIRMATION_DELAY_SECONDS = 120
 DEFAULT_HEARTBEAT_DAYS = 7
 DEFAULT_HISTORY_LIMIT = 100
 MAX_PDF_PREVIEW_PAIRS = 3
+SNAPSHOT_SCHEMA_VERSION = 3
 EXCLUDED_TOP_CATEGORIES = {"Construction", "Materials"}
 
 
@@ -72,6 +73,7 @@ class MainContentParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.in_main = False
         self.suppressed_depth = 0
+        self.generated_inventory_depth = 0
         self.text_parts: list[str] = []
         self.links: list[dict[str, str]] = []
         self.folders: list[str] = []
@@ -90,6 +92,12 @@ class MainContentParser(HTMLParser):
             return
         if not self.in_main:
             return
+        if self.generated_inventory_depth:
+            self.generated_inventory_depth += 1
+        elif attr_map.get("data-mdot-monitor-inventory") == "true":
+            # render_page adds this table solely to capture links and folders from
+            # MDOT's virtualized grids. Its text is not visible page copy.
+            self.generated_inventory_depth = 1
         if tag in {"script", "style", "svg", "noscript"}:
             self.suppressed_depth += 1
         if self.suppressed_depth:
@@ -110,6 +118,8 @@ class MainContentParser(HTMLParser):
         if tag == "main":
             self.in_main = False
             return
+        if self.generated_inventory_depth:
+            self.generated_inventory_depth -= 1
         if tag in {"script", "style", "svg", "noscript"} and self.suppressed_depth:
             self.suppressed_depth -= 1
         if not self.suppressed_depth:
@@ -135,8 +145,9 @@ class MainContentParser(HTMLParser):
         text = normalize_text(data)
         if not text:
             return
-        self.text_parts.append(text)
-        if self.current_heading is not None:
+        if not self.generated_inventory_depth:
+            self.text_parts.append(text)
+        if self.current_heading is not None and not self.generated_inventory_depth:
             self.current_heading.append(text)
         if self.current_link is not None:
             self.current_link["text"].append(text)
@@ -493,6 +504,14 @@ def download_document(item: dict[str, str], timeout_seconds: int = 180) -> dict[
         with tempfile.NamedTemporaryFile("wb", suffix=suffix, delete=False) as temp_file:
             temp_path = Path(temp_file.name)
             with urlopen(request, timeout=timeout_seconds) as response:
+                content_type = response.headers.get_content_type()
+                expected_extension = Path(unquote(urlsplit(item["url"]).path)).suffix.lower()
+                if expected_extension in DOCUMENT_EXTENSIONS and content_type.lower() in {
+                    "text/html", "application/xhtml+xml",
+                }:
+                    raise MonitorError(
+                        f"Expected a {expected_extension} file but the server returned {content_type} instead"
+                    )
                 digest = hashlib.sha256()
                 size = 0
                 while True:
@@ -509,13 +528,13 @@ def download_document(item: dict[str, str], timeout_seconds: int = 180) -> dict[
                 "identity": item.get("identity", item["url"]),
                 "sha256": digest.hexdigest(),
                 "size": size,
-                "content_type": response.headers.get_content_type(),
+                "content_type": content_type,
                 "content_disposition": response.headers.get("Content-Disposition", ""),
                 "etag": response.headers.get("ETag", ""),
                 "last_modified": response.headers.get("Last-Modified", ""),
                 "_temp_path": str(temp_path),
             }
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+    except (HTTPError, URLError, TimeoutError, OSError, MonitorError) as exc:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
         raise MonitorError(f"Could not download {item['title']} ({item['url']}): {exc}") from exc
@@ -898,7 +917,7 @@ def build_snapshot(
             temp_path.unlink(missing_ok=True)
     documents.sort(key=lambda item: item["url"].casefold())
     return {
-        "schema_version": 2,
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "page_url": page_url,
         "page_text": page["text"],
@@ -1166,7 +1185,10 @@ def describe_page_text_changes(old_text: str, new_text: str) -> list[str]:
 
 
 def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[str, object]:
-    folder_crawl_migration = int(old.get("schema_version", 1)) < 2 <= int(new.get("schema_version", 1))
+    old_schema = int(old.get("schema_version", 1))
+    new_schema = int(new.get("schema_version", 1))
+    folder_crawl_migration = old_schema < 2 <= new_schema
+    page_text_inventory_migration = old_schema < 3 <= new_schema
     old_docs = {
         item.get("identity", item["url"]): item
         for item in old.get("documents", [])
@@ -1241,8 +1263,8 @@ def compare_snapshots(old: dict[str, object], new: dict[str, object]) -> dict[st
     new_folders = {item["path"]: item for item in new.get("folders", [])}
     compare_folders = "folders" in old and "folders" in new
     return {
-        "page_text_changed": False if folder_crawl_migration else old.get("page_text") != new.get("page_text"),
-        "page_text_details": [] if folder_crawl_migration else describe_page_text_changes(
+        "page_text_changed": False if (folder_crawl_migration or page_text_inventory_migration) else old.get("page_text") != new.get("page_text"),
+        "page_text_details": [] if (folder_crawl_migration or page_text_inventory_migration) else describe_page_text_changes(
             str(old.get("page_text", "")),
             str(new.get("page_text", "")),
         ),
