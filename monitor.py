@@ -1885,7 +1885,10 @@ def send_outlook(
                 json.dump(inline_images, manifest, ensure_ascii=False)
                 image_manifest_path = Path(manifest.name)
             command.extend(["-InlineImagesJsonFile", str(image_manifest_path)])
-        result = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=90, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
         if result.returncode != 0:
             detail = normalize_text(result.stderr or result.stdout)
             raise MonitorError(f"Outlook could not send the email: {detail}")

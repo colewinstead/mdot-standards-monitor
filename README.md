@@ -30,7 +30,19 @@ For unattended installation, recipients can be supplied directly. A test email i
 .\install.ps1 -Recipients 'team@example.com;other@example.com'
 ```
 
-The installer creates the first baseline without sending an update alert and registers **MDOT Standards Daily Monitor** for 12:00 PM Monday through Friday. The task runs only while the installing user is logged on, starts after a missed schedule, and asks Windows to wake the computer when possible.
+The installer creates the first baseline without sending an update alert and registers **MDOT Standards Daily Monitor** for 12:00 PM Monday through Friday. Scheduled checks run in the background without a terminal window. The task runs only while the installing user is logged on, starts after a missed schedule, and asks Windows to wake the computer when possible.
+
+To apply background execution to an existing task, update the files on the computer that runs it,
+then run this from PowerShell in the project folder:
+
+```powershell
+.\install.ps1 -BackgroundOnly
+```
+
+This updates only the task's launch action, preserving its schedule, recipients, configuration,
+baseline, and history. It does not run a check or send email. Failures remain available in
+`%LOCALAPPDATA%\MDOTStandardsMonitor\monitor.log`. The **Run Check Early.cmd** shortcut still
+shows a terminal for manual checks.
 
 ## Commands
 

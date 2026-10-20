@@ -13,6 +13,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import monitor
 
 
+class OutlookLaunchTests(unittest.TestCase):
+    def test_email_helper_runs_without_a_console_and_reports_errors(self):
+        with mock.patch("monitor.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            monitor.send_outlook("Test", "<p>Test</p>", ["test@example.com"])
+            self.assertEqual(
+                monitor.subprocess.CREATE_NO_WINDOW if monitor.os.name == "nt" else 0,
+                run.call_args.kwargs["creationflags"],
+            )
+            run.return_value = mock.Mock(returncode=1, stderr="Outlook unavailable", stdout="")
+            with self.assertRaisesRegex(monitor.MonitorError, "Outlook unavailable"):
+                monitor.send_outlook("Test", "<p>Test</p>", ["test@example.com"])
+
+
 class PageParsingTests(unittest.TestCase):
     def test_extracts_main_text_links_and_documents(self):
         source = """

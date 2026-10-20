@@ -1,6 +1,8 @@
 param(
     [switch]$Remove,
 
+    [switch]$BackgroundOnly,
+
     [string]$Recipients,
 
     [string]$FailureRecipient = 'cole.winstead@stantec.com',
@@ -37,6 +39,24 @@ if (-not $pythonLauncher) {
 }
 if (-not $pythonLauncher) {
     throw 'Python was not found. Install Python 3.11 or newer and rerun this installer.'
+}
+
+$resolvePythonArguments = if ([IO.Path]::GetFileName($pythonLauncher) -ieq 'py.exe') {
+    @('-3.14', '-c', 'import pathlib, sys; print(pathlib.Path(sys.executable).with_name("pythonw.exe"))')
+}
+else {
+    @('-c', 'import pathlib, sys; print(pathlib.Path(sys.executable).with_name("pythonw.exe"))')
+}
+$backgroundPython = & $pythonLauncher @resolvePythonArguments
+if ($LASTEXITCODE -ne 0 -or -not $backgroundPython -or -not (Test-Path -LiteralPath $backgroundPython -PathType Leaf)) {
+    throw 'pythonw.exe was not found. Repair the Python installation to enable background checks.'
+}
+$action = New-ScheduledTaskAction -Execute $backgroundPython -Argument "`"$monitorScript`" check" -WorkingDirectory $PSScriptRoot
+if ($BackgroundOnly) {
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    Set-ScheduledTask -TaskName $existing.TaskName -TaskPath $existing.TaskPath -Action $action | Out-Null
+    Write-Host "Updated '$taskName' to run without a terminal window. Schedule, configuration, and baseline were retained."
+    return
 }
 
 $dependencyCheckArguments = if ([IO.Path]::GetFileName($pythonLauncher) -ieq 'py.exe') {
@@ -124,13 +144,6 @@ New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
     )
 } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $configFile -Encoding UTF8
 
-$pythonArguments = if ([IO.Path]::GetFileName($pythonLauncher) -ieq 'py.exe') {
-    "-3.14 `"$monitorScript`" check"
-}
-else {
-    "`"$monitorScript`" check"
-}
-$action = New-ScheduledTaskAction -Execute $pythonLauncher -Argument $pythonArguments -WorkingDirectory $PSScriptRoot
 $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday -At '12:00 PM'
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 6)
 $principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
