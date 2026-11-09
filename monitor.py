@@ -1037,7 +1037,11 @@ def highlight_pdf_previews(old_path: str, new_path: str) -> tuple[str, str, str]
         before, after = pymupdf.Pixmap(old_path), pymupdf.Pixmap(new_path)
         # shortcut: resized pages are not aligned; add registration if resized-sheet comparisons are needed.
         if (before.width, before.height) != (after.width, after.height):
-            return old_path, new_path, "Highlights unavailable: page dimensions differ."
+            return old_path, new_path, (
+                "Highlights unavailable: saved preview pixel dimensions differ "
+                f"({before.width}×{before.height} before; {after.width}×{after.height} after). "
+                "This does not establish a change in drawing paper size."
+            )
         old_gray = pymupdf.Pixmap(pymupdf.csGRAY, before)
         new_gray = pymupdf.Pixmap(pymupdf.csGRAY, after)
         width, height = before.width, before.height
@@ -1456,7 +1460,7 @@ def inline_images_for_changes(changes: dict[str, object]) -> list[dict[str, obje
                 path = str(preview.get(key, ""))
                 if path and path not in seen and Path(path).is_file():
                     seen.add(path)
-                    images.append({"path": path, "content_id": preview_content_id(path), "visible": True})
+                    images.append({"path": path, "content_id": preview_content_id(path)})
     return images
 
 
@@ -1467,6 +1471,7 @@ def format_change_email(
 ) -> str:
     e = html_module.escape
     sections: list[str] = []
+    enlarged_previews: dict[str, str] = {}
     link_style = (
         "color:#176b87;text-decoration:underline;font-weight:600;"
         "word-break:break-word;overflow-wrap:anywhere;"
@@ -1543,9 +1548,16 @@ def format_change_email(
                     if image_mode == "data":
                         content = f'<a href="#full-size-preview" title="Open full-size image"{enlarge}>{content}</a>'
                     if image_mode == "cid":
-                        content += (
-                            '<div style="font-size:11px;color:#526675;">'
-                            f'Full-size attachment: {e(Path(path).name)}</div>'
+                        bookmark = preview_content_id(path)
+                        content = f'<a href="#{bookmark}" title="View larger image below">{content}</a>'
+                        enlarged_previews[bookmark] = (
+                            '<tr><td style="padding:16px 28px;">'
+                            f'<a name="{bookmark}" id="{bookmark}"></a>'
+                            f'<p style="font:14px Segoe UI,Arial,sans-serif;"><strong>{e(str(new_document["title"]))} '
+                            f'— {e(label)}</strong> &nbsp; <a href="#preview-summary">Back to summary</a></p>'
+                            f'<img src="{e(source)}" alt="Larger {caption.lower()} page {number}" width="680" '
+                            'style="display:block;width:100%;max-width:680px;height:auto;border:1px solid #cbd6dc;">'
+                            '</td></tr>'
                         )
                 else:
                     content = "Preview unavailable." if number is not None else (
@@ -1564,8 +1576,8 @@ def format_change_email(
                 )
         if preview_rows:
             instructions = (
-                'Open a PNG attachment for the full-size image, or save and open '
-                'MDOT-change-review.html in your browser, then click an image to enlarge.'
+                'Click a thumbnail to jump to a larger image below in this email. '
+                'You can also scroll down to the larger images or use Outlook Zoom.'
                 if image_mode == "cid" else 'Click an image to enlarge it. Press Escape or Close to return.'
             )
             preview_html = (
@@ -1737,8 +1749,9 @@ def format_change_email(
         '<p style="margin:0;font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:23px;color:#364b5a;">'
         f'The daily check detected <strong>{total} change(s)</strong>.</p>'
         '<p style="margin:5px 0 0 0;font-family:Segoe UI,Arial,sans-serif;font-size:12px;line-height:18px;color:#71818c;">'
-        f'Checked {checked}</p></td></tr>'
+        f'Checked {checked}</p><a name="preview-summary" id="preview-summary"></a></td></tr>'
         + "".join(sections)
+        + "".join(enlarged_previews.values())
         + '<tr><td style="padding:4px 28px 28px 28px;">'
         '<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>'
         '<td style="background-color:#176b87;padding:12px 18px;">'
@@ -1986,7 +1999,6 @@ def send_outlook(
     body_html: str,
     recipients: list[str],
     inline_images: list[dict[str, object]] | None = None,
-    review_html: str | None = None,
 ) -> None:
     if not EMAIL_HELPER.exists():
         raise MonitorError(f"Outlook helper is missing: {EMAIL_HELPER}")
@@ -1994,7 +2006,6 @@ def send_outlook(
         body_file.write(body_html)
         body_path = Path(body_file.name)
     image_manifest_path: Path | None = None
-    review_directory = None
     try:
         command = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -2006,11 +2017,6 @@ def send_outlook(
                 json.dump(inline_images, manifest, ensure_ascii=False)
                 image_manifest_path = Path(manifest.name)
             command.extend(["-InlineImagesJsonFile", str(image_manifest_path)])
-        if review_html is not None:
-            review_directory = tempfile.TemporaryDirectory(prefix="mdot-review-")
-            review_path = Path(review_directory.name) / "MDOT-change-review.html"
-            review_path.write_text(review_html, encoding="utf-8")
-            command.extend(["-ReviewHtmlFile", str(review_path)])
         result = subprocess.run(
             command, capture_output=True, text=True, timeout=90, check=False,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
@@ -2022,8 +2028,6 @@ def send_outlook(
         body_path.unlink(missing_ok=True)
         if image_manifest_path is not None:
             image_manifest_path.unlink(missing_ok=True)
-        if review_directory is not None:
-            review_directory.cleanup()
 
 
 def default_runtime() -> dict[str, object]:
@@ -2258,8 +2262,6 @@ def run_check(args: argparse.Namespace) -> int:
                     format_change_email(routed_changes, snapshot),
                     recipients,
                     inline_images_for_changes(routed_changes),
-                    review_html=format_change_email(routed_changes, snapshot, image_mode="data")
-                    if any(item.get("previews") for item in routed_changes["documents_modified"]) else None,
                 )
                 logger.info("Sent %s update email to %d recipient(s)", label, len(recipients))
             atomic_write_json(STATE_FILE, snapshot)

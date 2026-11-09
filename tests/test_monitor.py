@@ -14,19 +14,6 @@ import monitor
 
 
 class OutlookLaunchTests(unittest.TestCase):
-    def test_review_attachment_is_written_for_outlook_and_cleaned_after_sending(self):
-        review_paths = []
-        def inspect_send(command, **kwargs):
-            path = Path(command[command.index("-ReviewHtmlFile") + 1])
-            review_paths.append(path)
-            self.assertEqual("MDOT-change-review.html", path.name)
-            self.assertEqual("<p>Local review</p>", path.read_text(encoding="utf-8"))
-            return mock.Mock(returncode=0)
-        with mock.patch("monitor.subprocess.run", side_effect=inspect_send):
-            monitor.send_outlook("Test", "<p>Test</p>", ["owner@example.com"], review_html="<p>Local review</p>")
-        self.assertFalse(review_paths[0].exists())
-        self.assertFalse(review_paths[0].parent.exists())
-
     def test_email_helper_runs_without_a_console_and_reports_errors(self):
         with mock.patch("monitor.subprocess.run") as run:
             run.return_value = mock.Mock(returncode=0)
@@ -377,7 +364,7 @@ class DetailedComparisonTests(unittest.TestCase):
             self.assertEqual(("missing.png", paths[0]), (old, new))
             self.assertIn("Highlights unavailable", note)
 
-    def test_email_uses_image_attachments_instead_of_unsupported_cid_links(self):
+    def test_email_links_thumbnails_to_larger_images_inside_the_message(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "after-page-75.png"
             path.write_bytes(b"image")
@@ -390,12 +377,16 @@ class DetailedComparisonTests(unittest.TestCase):
             source = monitor.preview_image_source(str(path), "cid")
             self.assertNotIn('href="cid:', body)
             self.assertIn(f'src="{source}"', body)
-            self.assertIn("Full-size attachment: after-page-75.png", body)
-            self.assertIn("MDOT-change-review.html", body)
+            bookmark = monitor.preview_content_id(str(path))
+            self.assertIn(f'href="#{bookmark}"', body)
+            self.assertIn(f'name="{bookmark}"', body)
+            self.assertIn('width="680"', body)
+            self.assertIn('href="#preview-summary"', body)
+            self.assertNotIn("MDOT-change-review.html", body)
             self.assertNotIn("onclick", body)
             images = monitor.inline_images_for_changes(changes)
             self.assertEqual(1, len(images))
-            self.assertTrue(images[0]["visible"])
+            self.assertNotIn("visible", images[0])
 
     def test_pdf_reports_every_changed_page_after_cover_and_index(self):
         import pymupdf
