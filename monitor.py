@@ -1029,6 +1029,63 @@ def describe_pdf_changes(old: dict[str, object], new: dict[str, object]) -> list
     return details
 
 
+def highlight_pdf_previews(old_path: str, new_path: str) -> tuple[str, str, str]:
+    """Outline regions containing changed pixels without modifying the saved originals."""
+    try:
+        import pymupdf
+
+        before, after = pymupdf.Pixmap(old_path), pymupdf.Pixmap(new_path)
+        # shortcut: resized pages are not aligned; add registration if resized-sheet comparisons are needed.
+        if (before.width, before.height) != (after.width, after.height):
+            return old_path, new_path, "Highlights unavailable: page dimensions differ."
+        old_gray = pymupdf.Pixmap(pymupdf.csGRAY, before)
+        new_gray = pymupdf.Pixmap(pymupdf.csGRAY, after)
+        width, height = before.width, before.height
+        cells = {
+            (index % width // 16, index // width // 16)
+            for index, (a, b) in enumerate(zip(old_gray.samples, new_gray.samples)) if a != b
+        }
+        boxes = []
+        while cells:
+            first = cells.pop()
+            region, pending = [first], [first]
+            while pending:
+                x, y = pending.pop()
+                for dx, dy in ((-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)):
+                    neighbor = (x + dx, y + dy)
+                    if neighbor in cells:
+                        cells.remove(neighbor)
+                        pending.append(neighbor)
+                        region.append(neighbor)
+            boxes.append((
+                max(0, min(x for x, y in region) * 16 - 3),
+                max(0, min(y for x, y in region) * 16 - 3),
+                min(width, (max(x for x, y in region) + 1) * 16 + 3),
+                min(height, (max(y for x, y in region) + 1) * 16 + 3),
+            ))
+        if not boxes:
+            return old_path, new_path, "No visible pixel differences found in the saved previews."
+        key = hashlib.sha256((old_path + "\0" + new_path).encode("utf-8")).hexdigest()[:16]
+        paths = []
+        for source, side in ((before, "before"), (after, "after")):
+            marked = pymupdf.Pixmap(pymupdf.csRGB, source)
+            for left, top, right, bottom in boxes:
+                for edge in (
+                    (left, top, right, min(top + 2, bottom)),
+                    (left, max(top, bottom - 2), right, bottom),
+                    (left, top, min(left + 2, right), bottom),
+                    (max(left, right - 2), top, right, bottom),
+                ):
+                    marked.set_rect(pymupdf.IRect(edge), (230, 45, 20))
+            output = Path(new_path).parent / f"changes-{key}-{side}-{Path(old_path if side == 'before' else new_path).stem}.png"
+            marked.save(output)
+            paths.append(str(output))
+        return paths[0], paths[1], "Red outlines mark visual differences; rendering noise may also be marked."
+    except Exception as exc:
+        logging.getLogger(APP_NAME).warning("Could not highlight PDF previews: %s", exc)
+        return old_path, new_path, "Highlights unavailable; showing original previews."
+
+
 def pdf_preview_pairs(old: dict[str, object], new: dict[str, object]) -> list[dict[str, object]]:
     if old.get("kind") != "pdf_pages" or new.get("kind") != "pdf_pages":
         return []
@@ -1036,11 +1093,17 @@ def pdf_preview_pairs(old: dict[str, object], new: dict[str, object]) -> list[di
     for old_page, new_page in changed_pdf_pages(old, new):
         old_path = str((old_page or {}).get("preview_path", ""))
         new_path = str((new_page or {}).get("preview_path", ""))
+        old_path = old_path if old_path and Path(old_path).is_file() else ""
+        new_path = new_path if new_path and Path(new_path).is_file() else ""
+        note = "Highlights require both page previews."
+        if old_path and new_path:
+            old_path, new_path, note = highlight_pdf_previews(old_path, new_path)
         previews.append({
             "old_page": int(old_page["page"]) if old_page is not None else None,
             "new_page": int(new_page["page"]) if new_page is not None else None,
-            "old_path": old_path if old_path and Path(old_path).is_file() else "",
-            "new_path": new_path if new_path and Path(new_path).is_file() else "",
+            "old_path": old_path,
+            "new_path": new_path,
+            "highlight_note": note,
         })
     return previews
 
@@ -1384,8 +1447,8 @@ def preview_image_source(path: str, image_mode: str) -> str:
     return "cid:" + preview_content_id(path)
 
 
-def inline_images_for_changes(changes: dict[str, object]) -> list[dict[str, str]]:
-    images: list[dict[str, str]] = []
+def inline_images_for_changes(changes: dict[str, object]) -> list[dict[str, object]]:
+    images: list[dict[str, object]] = []
     seen: set[str] = set()
     for item in changes.get("documents_modified", []):
         for preview in item.get("previews", []):
@@ -1393,7 +1456,7 @@ def inline_images_for_changes(changes: dict[str, object]) -> list[dict[str, str]
                 path = str(preview.get(key, ""))
                 if path and path not in seen and Path(path).is_file():
                     seen.add(path)
-                    images.append({"path": path, "content_id": preview_content_id(path)})
+                    images.append({"path": path, "content_id": preview_content_id(path), "visible": True})
     return images
 
 
@@ -1469,10 +1532,21 @@ def format_change_email(
                 source = preview_image_source(path, image_mode) if path else ""
                 label = caption.upper() + (f" — PAGE {number}" if number is not None else "")
                 if source:
+                    enlarge = (
+                        ' onclick="document.getElementById(\'full-size-image\').src=this.firstElementChild.src;'
+                        'document.getElementById(\'full-size-preview\').showModal();return false;"'
+                    )
                     content = (
                         f'<img src="{e(source)}" alt="{caption} page {number}" width="280" '
                         'style="display:block;width:100%;max-width:280px;height:auto;border:1px solid #cbd6dc;">'
                     )
+                    if image_mode == "data":
+                        content = f'<a href="#full-size-preview" title="Open full-size image"{enlarge}>{content}</a>'
+                    if image_mode == "cid":
+                        content += (
+                            '<div style="font-size:11px;color:#526675;">'
+                            f'Full-size attachment: {e(Path(path).name)}</div>'
+                        )
                 else:
                     content = "Preview unavailable." if number is not None else (
                         "No previous page (added)." if side == "old" else "Page removed."
@@ -1483,10 +1557,21 @@ def format_change_email(
                     f'{e(label)}</div>{content}</td>'
                 )
             preview_rows.append("<tr>" + "".join(cells) + "</tr>")
+            if preview.get("highlight_note"):
+                preview_rows.append(
+                    '<tr><td colspan="2" style="padding:4px 5px 12px;font-size:12px;color:#526675;">'
+                    f'{e(str(preview["highlight_note"]))}</td></tr>'
+                )
         if preview_rows:
+            instructions = (
+                'Open a PNG attachment for the full-size image, or save and open '
+                'MDOT-change-review.html in your browser, then click an image to enlarge.'
+                if image_mode == "cid" else 'Click an image to enlarge it. Press Escape or Close to return.'
+            )
             preview_html = (
                 '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
-                'style="margin-top:8px;">' + "".join(preview_rows) + "</table>"
+                'style="margin-top:8px;"><tr><td colspan="2" style="font-size:12px;color:#526675;">'
+                f'{instructions}</td></tr>' + "".join(preview_rows) + "</table>"
             )
         return f'{link(new_document["url"], new_document["title"])}{detail_html}{preview_html}'
 
@@ -1623,6 +1708,12 @@ def format_change_email(
     checked = e(str(snapshot["generated_at"]))
     page_url = e(str(snapshot["page_url"]))
     total = change_count(changes)
+    enlarge_dialog = "" if image_mode == "cid" else (
+        '<dialog id="full-size-preview" aria-label="Full-size page preview" '
+        'style="max-width:94vw;max-height:90vh;overflow:auto;">'
+        '<form method="dialog"><button autofocus>Close full-size image</button></form>'
+        '<img id="full-size-image" alt="Full-size page preview" style="display:block;max-width:none;"></dialog>'
+    )
     return (
         '<!doctype html><html><head><meta charset="utf-8"></head>'
         '<body style="margin:0;padding:0;background-color:#eaf0f3;">'
@@ -1656,7 +1747,7 @@ def format_change_email(
         '<tr><td style="padding:16px 28px;background-color:#f2f6f8;border-top:1px solid #d7e0e5;'
         'font-family:Segoe UI,Arial,sans-serif;font-size:11px;line-height:17px;color:#687985;">'
         'Automated by MDOT Standards Monitor. This message reports detected changes; it does not modify MDOT content.'
-        '</td></tr></table></td></tr></table></body></html>'
+        '</td></tr></table></td></tr></table>' + enlarge_dialog + '</body></html>'
     )
 
 
@@ -1894,7 +1985,8 @@ def send_outlook(
     subject: str,
     body_html: str,
     recipients: list[str],
-    inline_images: list[dict[str, str]] | None = None,
+    inline_images: list[dict[str, object]] | None = None,
+    review_html: str | None = None,
 ) -> None:
     if not EMAIL_HELPER.exists():
         raise MonitorError(f"Outlook helper is missing: {EMAIL_HELPER}")
@@ -1902,6 +1994,7 @@ def send_outlook(
         body_file.write(body_html)
         body_path = Path(body_file.name)
     image_manifest_path: Path | None = None
+    review_directory = None
     try:
         command = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -1913,6 +2006,11 @@ def send_outlook(
                 json.dump(inline_images, manifest, ensure_ascii=False)
                 image_manifest_path = Path(manifest.name)
             command.extend(["-InlineImagesJsonFile", str(image_manifest_path)])
+        if review_html is not None:
+            review_directory = tempfile.TemporaryDirectory(prefix="mdot-review-")
+            review_path = Path(review_directory.name) / "MDOT-change-review.html"
+            review_path.write_text(review_html, encoding="utf-8")
+            command.extend(["-ReviewHtmlFile", str(review_path)])
         result = subprocess.run(
             command, capture_output=True, text=True, timeout=90, check=False,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
@@ -1924,6 +2022,8 @@ def send_outlook(
         body_path.unlink(missing_ok=True)
         if image_manifest_path is not None:
             image_manifest_path.unlink(missing_ok=True)
+        if review_directory is not None:
+            review_directory.cleanup()
 
 
 def default_runtime() -> dict[str, object]:
@@ -2158,6 +2258,8 @@ def run_check(args: argparse.Namespace) -> int:
                     format_change_email(routed_changes, snapshot),
                     recipients,
                     inline_images_for_changes(routed_changes),
+                    review_html=format_change_email(routed_changes, snapshot, image_mode="data")
+                    if any(item.get("previews") for item in routed_changes["documents_modified"]) else None,
                 )
                 logger.info("Sent %s update email to %d recipient(s)", label, len(recipients))
             atomic_write_json(STATE_FILE, snapshot)

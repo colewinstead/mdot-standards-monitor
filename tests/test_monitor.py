@@ -14,6 +14,19 @@ import monitor
 
 
 class OutlookLaunchTests(unittest.TestCase):
+    def test_review_attachment_is_written_for_outlook_and_cleaned_after_sending(self):
+        review_paths = []
+        def inspect_send(command, **kwargs):
+            path = Path(command[command.index("-ReviewHtmlFile") + 1])
+            review_paths.append(path)
+            self.assertEqual("MDOT-change-review.html", path.name)
+            self.assertEqual("<p>Local review</p>", path.read_text(encoding="utf-8"))
+            return mock.Mock(returncode=0)
+        with mock.patch("monitor.subprocess.run", side_effect=inspect_send):
+            monitor.send_outlook("Test", "<p>Test</p>", ["owner@example.com"], review_html="<p>Local review</p>")
+        self.assertFalse(review_paths[0].exists())
+        self.assertFalse(review_paths[0].parent.exists())
+
     def test_email_helper_runs_without_a_console_and_reports_errors(self):
         with mock.patch("monitor.subprocess.run") as run:
             run.return_value = mock.Mock(returncode=0)
@@ -322,6 +335,68 @@ class ComparisonTests(unittest.TestCase):
 
 
 class DetailedComparisonTests(unittest.TestCase):
+    def test_pdf_highlights_separate_visual_changes_and_preserve_originals(self):
+        import pymupdf
+
+        with tempfile.TemporaryDirectory() as directory:
+            before, after = Path(directory) / "before.png", Path(directory) / "after.png"
+            pixmap = pymupdf.Pixmap(pymupdf.csGRAY, pymupdf.IRect(0, 0, 128, 128), False)
+            pixmap.clear_with(255)
+            pixmap.save(before)
+            pixmap.set_rect(pymupdf.IRect(8, 8, 10, 10), (0,))
+            pixmap.set_rect(pymupdf.IRect(104, 104, 106, 106), (0,))
+            pixmap.save(after)
+            originals = before.read_bytes(), after.read_bytes()
+            old_marked, new_marked, note = monitor.highlight_pdf_previews(str(before), str(after))
+            self.assertIn("Red outlines", note)
+            self.assertEqual(originals, (before.read_bytes(), after.read_bytes()))
+            for path in (old_marked, new_marked):
+                marked = pymupdf.Pixmap(path)
+                self.assertEqual((230, 45, 20), marked.pixel(0, 0))
+                self.assertEqual((230, 45, 20), marked.pixel(93, 93))
+                self.assertEqual((255, 255, 255), marked.pixel(64, 64))
+            self.assertEqual((0, 0, 0), pymupdf.Pixmap(new_marked).pixel(8, 8))
+
+    def test_pdf_highlights_handle_unchanged_resized_and_invalid_images(self):
+        import pymupdf
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [str(Path(directory) / f"{size}.png") for size in (64, 128)]
+            for size, path in zip((64, 128), paths):
+                pixmap = pymupdf.Pixmap(pymupdf.csGRAY, pymupdf.IRect(0, 0, size, size), False)
+                pixmap.clear_with(255)
+                pixmap.save(path)
+            old, new, note = monitor.highlight_pdf_previews(paths[0], paths[0])
+            self.assertEqual((paths[0], paths[0]), (old, new))
+            self.assertIn("No visible pixel differences", note)
+            old, new, note = monitor.highlight_pdf_previews(*paths)
+            self.assertEqual(tuple(paths), (old, new))
+            self.assertIn("dimensions differ", note)
+            with self.assertLogs(monitor.APP_NAME, level="WARNING"):
+                old, new, note = monitor.highlight_pdf_previews("missing.png", paths[0])
+            self.assertEqual(("missing.png", paths[0]), (old, new))
+            self.assertIn("Highlights unavailable", note)
+
+    def test_email_uses_image_attachments_instead_of_unsupported_cid_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "after-page-75.png"
+            path.write_bytes(b"image")
+            changes = monitor.compare_snapshots(snapshot(), snapshot())
+            changes["documents_modified"] = [{
+                "new": {"title": "Drawings", "url": "https://x/drawings.pdf"},
+                "previews": [{"old_page": 75, "new_page": 75, "old_path": "", "new_path": str(path)}],
+            }]
+            body = monitor.format_change_email(changes, {"generated_at": "now", "page_url": monitor.DEFAULT_URL})
+            source = monitor.preview_image_source(str(path), "cid")
+            self.assertNotIn('href="cid:', body)
+            self.assertIn(f'src="{source}"', body)
+            self.assertIn("Full-size attachment: after-page-75.png", body)
+            self.assertIn("MDOT-change-review.html", body)
+            self.assertNotIn("onclick", body)
+            images = monitor.inline_images_for_changes(changes)
+            self.assertEqual(1, len(images))
+            self.assertTrue(images[0]["visible"])
+
     def test_pdf_reports_every_changed_page_after_cover_and_index(self):
         import pymupdf
 

@@ -8,7 +8,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$HtmlBodyFile,
 
-    [string]$InlineImagesJsonFile
+    [string]$InlineImagesJsonFile,
+
+    [string]$ReviewHtmlFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +50,14 @@ try {
         )
         throw "Outlook could not resolve recipient(s): $($unresolved -join ', ')"
     }
+    if ($ReviewHtmlFile) {
+        if (-not (Test-Path -LiteralPath $ReviewHtmlFile -PathType Leaf)) {
+            throw "Review report was not found: $ReviewHtmlFile"
+        }
+        $stage = 'attaching the full-size review report'
+        $attachment = $mail.Attachments.Add($ReviewHtmlFile)
+        $inlineAttachments += $attachment
+    }
     if ($InlineImagesJsonFile) {
         if (-not (Test-Path -LiteralPath $InlineImagesJsonFile -PathType Leaf)) {
             throw "Inline-image manifest was not found: $InlineImagesJsonFile"
@@ -67,13 +77,15 @@ try {
                 'http://schemas.microsoft.com/mapi/proptag/0x3712001F',
                 [string]$image.content_id
             )
-            $stage = "hiding inline attachment $($image.path)"
+            $stage = "setting attachment visibility for $($image.path)"
             $attachment.PropertyAccessor.SetProperty(
                 'http://schemas.microsoft.com/mapi/proptag/0x7FFE000B',
-                $true
+                (-not [bool]$image.visible)
             )
             $inlineAttachments += $attachment
         }
+    }
+    if ($InlineImagesJsonFile -or $ReviewHtmlFile) {
         # Outlook can reject Send() with E_INVALIDARG when attachment MAPI
         # properties have not yet been committed to the MailItem.
         $stage = 'saving the message with inline attachments'

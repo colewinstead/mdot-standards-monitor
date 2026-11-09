@@ -18,6 +18,17 @@ sheet IDs are separate labels. The excerpts describe extracted text, so review t
 for graphical revisions or text that the PDF does not extract cleanly. Reports with many
 changed pages will be larger because all changed-page previews are included.
 
+Red outlines mark regions with different pixels in the saved before/after images; they can
+also mark rendering noise. Highlights require both previews at matching pixel dimensions.
+If an image is missing, resized, or cannot be compared, the report explains why highlights
+are unavailable and keeps the original previews.
+
+To enlarge an email preview, open its PNG attachment. Change emails with PDF previews also
+attach `MDOT-change-review.html`: save it, open it in your browser, and click an image for
+a full-size view. Press Escape or Close to return. The review file embeds its images and
+works offline. Inline email images have no attachment hyperlinks because Classic Outlook
+passes `cid:` links to Windows instead of opening the image.
+
 Temporary rendering or download failures are retried with exponential backoff. Retries are scoped to the failed page render, dynamic link resolution, or individual document, so one unavailable file does not restart every completed download. A detected change is checked a second time after two minutes before anyone is notified. The monitor also keeps a local change-history dashboard and sends a quiet weekly health summary so the team knows monitoring is still operational.
 
 If one document remains unavailable after all retries, the monitor retains its last good snapshot and continues checking and reporting changes in every other document. The configured failure recipient receives a separate private warning; document errors are never included in the team change email.
