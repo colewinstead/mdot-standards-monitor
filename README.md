@@ -36,8 +36,13 @@ To apply background execution to an existing task, update the files on the compu
 then run this from PowerShell in the project folder:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\install.ps1 -BackgroundOnly
 ```
+
+Run both commands in the same PowerShell window. The policy change applies only to that
+window, requires no administrator rights, and does not change the computer's saved policy.
+If company Group Policy prevents the change, contact IT.
 
 This updates only the task's launch action, preserving its schedule, recipients, configuration,
 baseline, and history. It does not run a check or send email. Failures remain available in
@@ -127,6 +132,12 @@ Change alerts go to the applicable recipient lists. Check failures, immediate Ou
 and the weekly health summary go only to the configured failure recipient. The team does not receive
 routine health messages. Unchanged daily checks remain silent. Set `heartbeat_days` to zero through
 the configuration command to disable the weekly summary.
+
+A document warning saying the server returned `text/html` can mean MDOT redirected a broken
+document link to its error page. The warning includes the final response URL to help identify
+this case. The monitor rejects that HTML and retains the last good document snapshot; the
+published link must be repaired by MDOT. A ProjectWise `504: Gateway Time-out` is a separate
+server availability failure. Document warnings go only to the configured failure recipient.
 
 Existing installations can pull updates in place. The scheduled task, configuration, baseline, and
 history remain intact; do not rerun `install.ps1` merely to update the program.

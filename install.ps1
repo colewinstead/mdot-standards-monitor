@@ -42,10 +42,10 @@ if (-not $pythonLauncher) {
 }
 
 $resolvePythonArguments = if ([IO.Path]::GetFileName($pythonLauncher) -ieq 'py.exe') {
-    @('-3.14', '-c', 'import pathlib, sys; print(pathlib.Path(sys.executable).with_name("pythonw.exe"))')
+    @('-3.14', '-c', 'import pathlib, sys; print(pathlib.Path(sys.executable).with_name(''pythonw.exe''))')
 }
 else {
-    @('-c', 'import pathlib, sys; print(pathlib.Path(sys.executable).with_name("pythonw.exe"))')
+    @('-c', 'import pathlib, sys; print(pathlib.Path(sys.executable).with_name(''pythonw.exe''))')
 }
 $backgroundPython = & $pythonLauncher @resolvePythonArguments
 if ($LASTEXITCODE -ne 0 -or -not $backgroundPython -or -not (Test-Path -LiteralPath $backgroundPython -PathType Leaf)) {

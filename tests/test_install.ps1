@@ -1,11 +1,12 @@
 $ErrorActionPreference = 'Stop'
 $installer = Join-Path (Split-Path $PSScriptRoot -Parent) 'install.ps1'
-$global:TestBackgroundPython = 'C:\Python Test\pythonw.exe'
+$global:TestPythonExecutable = (Get-Command python.exe -ErrorAction Stop).Source
+$global:TestBackgroundPython = Join-Path (Split-Path $global:TestPythonExecutable -Parent) 'pythonw.exe'
 
 function Get-Command { [pscustomobject]@{ Source = 'Test-Python' } }
 function Test-Python {
-    $global:LASTEXITCODE = 0
-    $global:TestBackgroundPython
+    & $global:TestPythonExecutable @args
+    if ($LASTEXITCODE -ne 0) { throw 'Python executable resolution failed.' }
 }
 function Test-Path {
     param($LiteralPath, $PathType)
@@ -37,4 +38,4 @@ if ($global:TestUpdatedTask.TaskName -ne 'MDOT Standards Daily Monitor' -or
     $global:TestUpdatedTask.Action.WorkingDirectory -ne $root) {
     throw 'Incorrect background task action.'
 }
-Write-Host 'Background-only task update passed (Task Scheduler and Python mocked).'
+Write-Host 'Background-only task update passed (real Python, Task Scheduler mocked).'

@@ -510,7 +510,8 @@ def download_document(item: dict[str, str], timeout_seconds: int = 180) -> dict[
                     "text/html", "application/xhtml+xml",
                 }:
                     raise MonitorError(
-                        f"Expected a {expected_extension} file but the server returned {content_type} instead"
+                        f"Expected a {expected_extension} file but the server returned {content_type} instead "
+                        f"(response URL: {response.geturl()})"
                     )
                 digest = hashlib.sha256()
                 size = 0

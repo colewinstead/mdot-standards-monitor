@@ -126,6 +126,24 @@ class HashTests(unittest.TestCase):
         )
         self.assertEqual(".pdf", extension)
 
+    def test_html_redirect_reports_the_error_page_and_removes_temporary_download(self):
+        headers = Message()
+        headers.add_header("Content-Type", "text/html")
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers = headers
+        response.geturl.return_value = "https://mdot.ms.gov/portal/404/error.html"
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch("monitor.tempfile.tempdir", directory), \
+             mock.patch("monitor.urlopen", return_value=response):
+            with self.assertRaisesRegex(monitor.MonitorError, "response URL: https://mdot.ms.gov/portal/404/error.html"):
+                monitor.download_document({
+                    "url": "https://mdot.ms.gov/documents/broken.pdf",
+                    "title": "Broken PDF",
+                    "section": "Roadway",
+                })
+            self.assertEqual([], list(Path(directory).iterdir()))
+
 
 def snapshot(text="Page", documents=None, links=None, folders=None):
     return {
