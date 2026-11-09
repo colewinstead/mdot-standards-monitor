@@ -586,6 +586,10 @@ def analyze_pdf(path: Path, preview_directory: Path | None = None) -> dict[str, 
                     "text": text,
                     "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                     "visual_sha256": hashlib.sha256(pixmap.samples).hexdigest(),
+                    "media_box": list(page.mediabox),
+                    "crop_box": list(page.cropbox),
+                    "rotation": page.rotation,
+                    "render_dpi": 48,
                 }
                 if preview_directory is not None:
                     preview_path = preview_directory / f"page-{index + 1:04d}.png"
@@ -1548,13 +1552,13 @@ def format_change_email(
                     if image_mode == "data":
                         content = f'<a href="#full-size-preview" title="Open full-size image"{enlarge}>{content}</a>'
                     if image_mode == "cid":
-                        bookmark = preview_content_id(path)
+                        bookmark = preview_content_id(path).replace("-", "_")
                         content = f'<a href="#{bookmark}" title="View larger image below">{content}</a>'
                         enlarged_previews[bookmark] = (
                             '<tr><td style="padding:16px 28px;">'
                             f'<a name="{bookmark}" id="{bookmark}"></a>'
                             f'<p style="font:14px Segoe UI,Arial,sans-serif;"><strong>{e(str(new_document["title"]))} '
-                            f'— {e(label)}</strong> &nbsp; <a href="#preview-summary">Back to summary</a></p>'
+                            f'— {e(label)}</strong> &nbsp; <a href="#preview_summary">Back to summary</a></p>'
                             f'<img src="{e(source)}" alt="Larger {caption.lower()} page {number}" width="680" '
                             'style="display:block;width:100%;max-width:680px;height:auto;border:1px solid #cbd6dc;">'
                             '</td></tr>'
@@ -1749,7 +1753,7 @@ def format_change_email(
         '<p style="margin:0;font-family:Segoe UI,Arial,sans-serif;font-size:15px;line-height:23px;color:#364b5a;">'
         f'The daily check detected <strong>{total} change(s)</strong>.</p>'
         '<p style="margin:5px 0 0 0;font-family:Segoe UI,Arial,sans-serif;font-size:12px;line-height:18px;color:#71818c;">'
-        f'Checked {checked}</p><a name="preview-summary" id="preview-summary"></a></td></tr>'
+        f'Checked {checked}</p><a name="preview_summary" id="preview_summary"></a></td></tr>'
         + "".join(sections)
         + "".join(enlarged_previews.values())
         + '<tr><td style="padding:4px 28px 28px 28px;">'

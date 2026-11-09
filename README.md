@@ -23,11 +23,15 @@ also mark rendering noise. Highlights require both previews at matching pixel di
 If an image is missing, resized, or cannot be compared, the report explains why highlights
 are unavailable and keeps the original previews.
 
-To enlarge an email preview, open its PNG attachment. Change emails with PDF previews also
-attach `MDOT-change-review.html`: save it, open it in your browser, and click an image for
-a full-size view. Press Escape or Close to return. The review file embeds its images and
-works offline. Inline email images have no attachment hyperlinks because Classic Outlook
-passes `cid:` links to Windows instead of opening the image.
+Email thumbnails link to larger, stacked images farther down in the same message using
+Outlook bookmarks. No separate review attachment is required. Use **Back to summary** to
+return, or scroll through the larger images if your email client does not follow bookmarks.
+Outlook's Zoom control can enlarge the message further. Saved local HTML reports also
+support clicking images to open a full-size view; press Escape or Close to return.
+
+Different PNG pixel dimensions do not prove the drawing's paper size changed: PDF crops,
+export settings, and rendering can affect the saved image. Newly analyzed PDFs retain their
+media box, crop box, rotation, and rendering DPI for diagnosing future discrepancies.
 
 Temporary rendering or download failures are retried with exponential backoff. Retries are scoped to the failed page render, dynamic link resolution, or individual document, so one unavailable file does not restart every completed download. A detected change is checked a second time after two minutes before anyone is notified. The monitor also keeps a local change-history dashboard and sends a quiet weekly health summary so the team knows monitoring is still operational.
 
