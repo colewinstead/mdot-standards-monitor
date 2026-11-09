@@ -22,6 +22,7 @@ import time
 import zipfile
 from datetime import datetime
 from html.parser import HTMLParser
+from itertools import zip_longest
 from typing import BinaryIO, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
@@ -57,9 +58,20 @@ DEFAULT_RETRY_DELAY_SECONDS = 5
 DEFAULT_CONFIRMATION_DELAY_SECONDS = 120
 DEFAULT_HEARTBEAT_DAYS = 7
 DEFAULT_HISTORY_LIMIT = 100
-MAX_PDF_PREVIEW_PAIRS = 3
 SNAPSHOT_SCHEMA_VERSION = 3
 EXCLUDED_TOP_CATEGORIES = {"Construction", "Materials"}
+EXCLUDED_MEMO_FILENAMES = {
+    "1996-06-04 TCP-4 + TCP-5.pdf",
+    "1996-11-13b Overlay Projects 2 Wide, +- 3 in Depth, Both Sides on Roadway $18,000 to $20,000 Per Mile (2 Lane Roadway).pdf",
+    "2001-07-23 Guardrail Maintenance + Installation Policy for the National Highway System (NHS).pdf",
+    "2001-11-02 REVISED Guardrail Maintenance + Installation Policy for the National Highway System (NHS).pdf",
+    "2006-11-16 Standard Drawings TCP-3 + TCP-4.pdf",
+    "2009-11-12 Special Design Sheets SDTCP-3 + SDTCP-4.pdf",
+    "2010-03-09 Grassing Items + Example.pdf",
+    "2012-06-06 TCP-10 + SN-8.pdf",
+    "2012-09-18 Riprap + Geotextile Fabric at Bridge Sites.pdf",
+    "2014-03-11 SDFI-1 + SDFI-1A.pdf",
+}
 
 
 class MonitorError(RuntimeError):
@@ -199,11 +211,19 @@ def is_mdot_document(url: str) -> bool:
 
 
 def is_excluded_document(item: dict[str, object]) -> bool:
-    """Exclude the two top-level website sections the team does not monitor."""
+    """Exclude unmonitored sections and the owner's retired broken memo links."""
     section = str(item.get("section", "")).split(" / ", 1)[0].casefold()
     if section in {value.casefold() for value in EXCLUDED_TOP_CATEGORIES}:
         return True
-    path = unquote(urlsplit(str(item.get("url", ""))).path).replace("\\", "/").casefold()
+    parts = urlsplit(str(item.get("url", "")))
+    decoded_path = unquote(parts.path).replace("\\", "/")
+    if (
+        parts.hostname in {"mdot.ms.gov", "www.mdot.ms.gov"}
+        and decoded_path.rsplit("/", 1)[0] == "/documents/Roadway Design/Standards/Memos"
+        and decoded_path.rsplit("/", 1)[-1] in EXCLUDED_MEMO_FILENAMES
+    ):
+        return True
+    path = decoded_path.casefold()
     return path.startswith("/documents/construction/") or path.startswith("/documents/materials/")
 
 
@@ -870,7 +890,10 @@ def build_snapshot(
             document_links.append(resolved)
             known_urls.add(resolved["url"])
             logger.info("Resolved dynamic document %s to %s", resolved["title"], resolved["url"])
-    document_links = [item for item in document_links if item_matches_filters(item, filters)]
+    document_links = [
+        item for item in document_links
+        if not is_excluded_document(item) and item_matches_filters(item, filters)
+    ]
     filtered_page_links = [
         item for item in page["links"]
         if item_matches_filters(item, {"sections": normalize_filters(filters)["sections"], "titles": normalize_filters(filters)["titles"]})
@@ -952,75 +975,73 @@ def range_label(numbers: list[int]) -> str:
     return str(numbers[0]) if len(numbers) == 1 else f"{numbers[0]}–{numbers[-1]}"
 
 
-def describe_pdf_changes(old: dict[str, object], new: dict[str, object]) -> list[str]:
+def changed_pdf_pages(old: dict[str, object], new: dict[str, object]):
+    """Use unchanged pages as anchors for both descriptions and previews."""
     old_pages = list(old.get("pages", []))
     new_pages = list(new.get("pages", []))
     old_signatures = [page.get("visual_sha256") or page.get("text_sha256") for page in old_pages]
     new_signatures = [page.get("visual_sha256") or page.get("text_sha256") for page in new_pages]
     matcher = difflib.SequenceMatcher(a=old_signatures, b=new_signatures, autojunk=False)
-    details: list[str] = []
     for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes():
         if operation == "equal":
             continue
-        if operation == "delete":
-            pages = [int(page["page"]) for page in old_pages[old_start:old_end]]
-            details.append(f"Old page(s) {range_label(pages)} removed")
-            continue
-        if operation == "insert":
-            pages = [int(page["page"]) for page in new_pages[new_start:new_end]]
-            details.append(f"New page(s) {range_label(pages)} added")
-            continue
+        yield from zip_longest(old_pages[old_start:old_end], new_pages[new_start:new_end])
 
-        old_block = old_pages[old_start:old_end]
-        new_block = new_pages[new_start:new_end]
-        paired = min(len(old_block), len(new_block))
-        for index in range(paired):
-            old_page, new_page = old_block[index], new_block[index]
+
+def pdf_text_excerpt(old_text: str, new_text: str) -> str:
+    old_words, new_words = old_text.split(), new_text.split()
+    if old_words == new_words:
+        return "Visual change; extracted text unchanged." if old_words else "Visual change; no extractable text."
+    edits = [
+        (old_start, old_end, new_start, new_end)
+        for operation, old_start, old_end, new_start, new_end in
+        difflib.SequenceMatcher(a=old_words, b=new_words, autojunk=False).get_opcodes()
+        if operation != "equal"
+    ]
+    excerpts = []
+    for old_start, old_end, new_start, new_end in edits[:3]:
+        before = " ".join(old_words[max(0, old_start - 3):old_end + 3])
+        after = " ".join(new_words[max(0, new_start - 3):new_end + 3])
+        before = before[:120] + ("..." if len(before) > 120 else "")
+        after = after[:120] + ("..." if len(after) > 120 else "")
+        excerpts.append(f'"{before}" → "{after}"')
+    suffix = f"; {len(edits) - 3} more text edit(s)" if len(edits) > 3 else ""
+    return "Text excerpts: " + "; ".join(excerpts) + suffix
+
+
+def describe_pdf_changes(old: dict[str, object], new: dict[str, object]) -> list[str]:
+    details: list[str] = []
+    for old_page, new_page in changed_pdf_pages(old, new):
+        page = new_page if new_page is not None else old_page
+        sheet = re.search(r"WORKING NUMBER\s*\n\s*([A-Z]{1,6}-[A-Z0-9]+)\s*\n", str(page.get("text", "")))
+        sheet_label = f" (sheet {sheet.group(1)})" if sheet else ""
+        if old_page is None:
+            details.append(f"New page {new_page['page']}{sheet_label} added")
+        elif new_page is None:
+            details.append(f"Old page {old_page['page']}{sheet_label} removed")
+        else:
             old_number, new_number = int(old_page["page"]), int(new_page["page"])
             label = f"Page {new_number}" if old_number == new_number else f"Old page {old_number} / new page {new_number}"
-            excerpt = compact_excerpt(
-                normalized_lines(str(old_page.get("text", ""))),
-                normalized_lines(str(new_page.get("text", ""))),
-            )
-            details.append(f"{label} changed — {excerpt}")
-        if len(old_block) > paired:
-            pages = [int(page["page"]) for page in old_block[paired:]]
-            details.append(f"Old page(s) {range_label(pages)} removed")
-        if len(new_block) > paired:
-            pages = [int(page["page"]) for page in new_block[paired:]]
-            details.append(f"New page(s) {range_label(pages)} added")
+            excerpt = pdf_text_excerpt(str(old_page.get("text", "")), str(new_page.get("text", "")))
+            details.append(f"{label} changed{sheet_label} — {excerpt}")
     if not details:
         details.append("File packaging or metadata changed; no rendered page difference was found")
-    return details[:20] + ([f"{len(details) - 20} additional page change(s) omitted"] if len(details) > 20 else [])
+    return details
 
 
 def pdf_preview_pairs(old: dict[str, object], new: dict[str, object]) -> list[dict[str, object]]:
     if old.get("kind") != "pdf_pages" or new.get("kind") != "pdf_pages":
         return []
-    old_pages = list(old.get("pages", []))
-    new_pages = list(new.get("pages", []))
-    old_signatures = [page.get("visual_sha256") or page.get("text_sha256") for page in old_pages]
-    new_signatures = [page.get("visual_sha256") or page.get("text_sha256") for page in new_pages]
-    matcher = difflib.SequenceMatcher(a=old_signatures, b=new_signatures, autojunk=False)
     previews: list[dict[str, object]] = []
-    for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes():
-        if operation == "equal":
-            continue
-        paired = min(old_end - old_start, new_end - new_start)
-        for offset in range(paired):
-            old_page = old_pages[old_start + offset]
-            new_page = new_pages[new_start + offset]
-            old_path = str(old_page.get("preview_path", ""))
-            new_path = str(new_page.get("preview_path", ""))
-            if old_path and new_path and Path(old_path).is_file() and Path(new_path).is_file():
-                previews.append({
-                    "old_page": int(old_page["page"]),
-                    "new_page": int(new_page["page"]),
-                    "old_path": old_path,
-                    "new_path": new_path,
-                })
-            if len(previews) >= MAX_PDF_PREVIEW_PAIRS:
-                return previews
+    for old_page, new_page in changed_pdf_pages(old, new):
+        old_path = str((old_page or {}).get("preview_path", ""))
+        new_path = str((new_page or {}).get("preview_path", ""))
+        previews.append({
+            "old_page": int(old_page["page"]) if old_page is not None else None,
+            "new_page": int(new_page["page"]) if new_page is not None else None,
+            "old_path": old_path if old_path and Path(old_path).is_file() else "",
+            "new_path": new_path if new_path and Path(new_path).is_file() else "",
+        })
     return previews
 
 
@@ -1441,21 +1462,27 @@ def format_change_email(
         preview_html = ""
         preview_rows = []
         for preview in item.get("previews", []):
-            old_source = preview_image_source(str(preview.get("old_path", "")), image_mode)
-            new_source = preview_image_source(str(preview.get("new_path", "")), image_mode)
-            if not old_source or not new_source:
-                continue
-            old_page = int(preview["old_page"])
-            new_page = int(preview["new_page"])
-            preview_rows.append(
-                '<tr><td width="50%" valign="top" style="padding:10px 5px 4px 0;">'
-                f'<div style="padding-bottom:5px;font-size:11px;line-height:16px;font-weight:700;color:#687985;">BEFORE — PAGE {old_page}</div>'
-                f'<img src="{e(old_source)}" alt="Before page {old_page}" width="280" style="display:block;width:100%;max-width:280px;height:auto;border:1px solid #cbd6dc;">'
-                '</td><td width="50%" valign="top" style="padding:10px 0 4px 5px;">'
-                f'<div style="padding-bottom:5px;font-size:11px;line-height:16px;font-weight:700;color:#687985;">AFTER — PAGE {new_page}</div>'
-                f'<img src="{e(new_source)}" alt="After page {new_page}" width="280" style="display:block;width:100%;max-width:280px;height:auto;border:1px solid #cbd6dc;">'
-                '</td></tr>'
-            )
+            cells = []
+            for side, caption in (("old", "Before"), ("new", "After")):
+                number = preview.get(side + "_page")
+                path = str(preview.get(side + "_path", ""))
+                source = preview_image_source(path, image_mode) if path else ""
+                label = caption.upper() + (f" — PAGE {number}" if number is not None else "")
+                if source:
+                    content = (
+                        f'<img src="{e(source)}" alt="{caption} page {number}" width="280" '
+                        'style="display:block;width:100%;max-width:280px;height:auto;border:1px solid #cbd6dc;">'
+                    )
+                else:
+                    content = "Preview unavailable." if number is not None else (
+                        "No previous page (added)." if side == "old" else "Page removed."
+                    )
+                cells.append(
+                    '<td width="50%" valign="top" style="padding:10px 5px 4px 5px;">'
+                    '<div style="padding-bottom:5px;font-size:11px;line-height:16px;font-weight:700;color:#687985;">'
+                    f'{e(label)}</div>{content}</td>'
+                )
+            preview_rows.append("<tr>" + "".join(cells) + "</tr>")
         if preview_rows:
             preview_html = (
                 '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '

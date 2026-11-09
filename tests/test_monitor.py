@@ -282,8 +282,128 @@ class ComparisonTests(unittest.TestCase):
         self.assertFalse(changes["documents_removed"])
         self.assertFalse(monitor.has_changes(changes))
 
+    def test_retired_memos_are_not_downloaded_or_reported_as_removed(self):
+        memos = [
+            document(monitor.canonicalize_url(
+                monitor.DEFAULT_URL, "/documents/Roadway Design/Standards/Memos/" + filename,
+            ), filename, "old")
+            for filename in monitor.EXCLUDED_MEMO_FILENAMES
+        ]
+        page = {"text": "Page", "folders": [], "links": memos}
+        with mock.patch("monitor.render_page", return_value="rendered"), \
+             mock.patch("monitor.parse_rendered_page", return_value=page), \
+             mock.patch("monitor.download_document") as downloader, \
+             mock.patch("monitor.send_outlook") as sender:
+            result = monitor.build_snapshot(
+                monitor.DEFAULT_URL, mock.Mock(),
+                previous_snapshot=snapshot(documents=memos, links=memos),
+                extra_documents=memos, store_previews=False,
+            )
+            downloader.assert_not_called()
+            sender.assert_not_called()
+        self.assertEqual([], result["documents"])
+        self.assertEqual([], result["document_errors"])
+        changes = monitor.compare_snapshots(
+            snapshot(documents=memos, links=memos), snapshot(),
+        )
+        self.assertFalse(monitor.has_changes(changes))
+
+    def test_other_memos_and_drawings_remain_monitored(self):
+        for path in (
+            "/documents/Roadway Design/Standards/Memos/2026-11-09 New Memo.pdf",
+            "/documents/Roadway Design/Standards/Memos/2014-03-11 Other Memo.pdf",
+            "/documents/Roadway Design/Standards/Vegetation Schedule/Old + Drawing.dgn",
+            "/documents/Other/2014-03-11 SDFI-1 + SDFI-1A.pdf",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(monitor.is_excluded_document({
+                    "url": monitor.canonicalize_url(monitor.DEFAULT_URL, path),
+                }))
+
 
 class DetailedComparisonTests(unittest.TestCase):
+    def test_pdf_reports_every_changed_page_after_cover_and_index(self):
+        import pymupdf
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            analyses = []
+            for version in ("Before", "After"):
+                path = root / f"{version}.pdf"
+                with pymupdf.open() as pdf:
+                    for number in range(1, 7):
+                        page = pdf.new_page()
+                        page.insert_text((72, 72), f"{version} page {number}")
+                        if number >= 4:
+                            page.insert_text((72, 120), f"WORKING NUMBER\nGR-{number}")
+                    pdf.save(path)
+                analyses.append(monitor.analyze_pdf(path, root / version))
+            previews = monitor.pdf_preview_pairs(*analyses)
+            self.assertEqual(list(range(1, 7)), [pair["new_page"] for pair in previews])
+            self.assertEqual(12, len(monitor.inline_images_for_changes({
+                "documents_modified": [{"previews": previews}],
+            })))
+            details = monitor.describe_pdf_changes(*analyses)
+            self.assertEqual(6, len(details))
+            self.assertTrue(any("sheet GR-6" in detail for detail in details))
+            changes = monitor.compare_snapshots(
+                snapshot(documents=[dict(document("https://x/a.pdf", "A", "old"), analysis=analyses[0])]),
+                snapshot(documents=[dict(document("https://x/a.pdf", "A", "new"), analysis=analyses[1])]),
+            )
+            current = dict(snapshot(), generated_at="now", page_url=monitor.DEFAULT_URL)
+            body = monitor.format_change_email(changes, current, image_mode="data")
+            self.assertIn("BEFORE — PAGE 6", body)
+            self.assertIn("AFTER — PAGE 6", body)
+            self.assertEqual(12, body.count("data:image/png;base64,"))
+
+    def test_pdf_descriptions_are_not_limited_to_twenty_pages(self):
+        before = {"kind": "pdf_pages", "pages": [
+            {"page": n, "visual_sha256": f"old-{n}", "text": ""} for n in range(1, 26)
+        ]}
+        after = {"kind": "pdf_pages", "pages": [
+            {"page": n, "visual_sha256": f"new-{n}", "text": ""} for n in range(1, 26)
+        ]}
+        details = monitor.describe_pdf_changes(before, after)
+        self.assertEqual(25, len(details))
+        self.assertIn("Page 25 changed", details[-1])
+        self.assertIn("no extractable text", details[-1])
+
+    def test_pdf_insertions_and_removals_do_not_pair_unchanged_pages(self):
+        old = {"kind": "pdf_pages", "pages": [
+            {"page": 1, "visual_sha256": "cover"},
+            {"page": 2, "visual_sha256": "drawing"},
+        ]}
+        new = {"kind": "pdf_pages", "pages": [
+            {"page": 1, "visual_sha256": "cover"},
+            {"page": 2, "visual_sha256": "inserted"},
+            {"page": 3, "visual_sha256": "drawing"},
+        ]}
+        for before, after, expected, missing_message in (
+            (old, new, (None, 2), "No previous page (added)."),
+            (new, old, (2, None), "Page removed."),
+        ):
+            with self.subTest(expected=expected):
+                previews = monitor.pdf_preview_pairs(before, after)
+                self.assertEqual([expected], [(p["old_page"], p["new_page"]) for p in previews])
+                changes = monitor.compare_snapshots(snapshot(), snapshot())
+                changes["documents_modified"] = [{
+                    "new": {"url": "https://x/a.pdf", "title": "A"}, "previews": previews,
+                }]
+                body = monitor.format_change_email(
+                    changes, {"generated_at": "now", "page_url": monitor.DEFAULT_URL}, image_mode="data",
+                )
+                self.assertIn(missing_message, body)
+                self.assertIn("Preview unavailable.", body)
+
+    def test_pdf_text_excerpts_keep_context_and_distinguish_visual_changes(self):
+        old = "Unchanged heading\nThe required width is six inches.\nUnchanged footer"
+        new = "Unchanged heading\nThe required width is eight inches.\nUnchanged footer"
+        excerpt = monitor.pdf_text_excerpt(old, new)
+        self.assertIn('"required width is six inches. Unchanged footer"', excerpt)
+        self.assertIn('"required width is eight inches. Unchanged footer"', excerpt)
+        self.assertNotIn("Unchanged heading", excerpt)
+        self.assertEqual("Visual change; extracted text unchanged.", monitor.pdf_text_excerpt(old, old))
+
     def test_pdf_repackaging_without_rendered_page_change_is_not_notifiable(self):
         old = document("https://mdot.ms.gov/documents/a.pdf", "Manual", "old-hash")
         new = document("https://mdot.ms.gov/documents/a.pdf", "Manual", "new-hash")

@@ -4,6 +4,11 @@ This Windows utility checks the MDOT Engineering Standards/Guides/Manuals page e
 
 The website sections **Construction** and **Construction Materials** (the latter is represented by the top-level `Materials` category in the site's data grid) are intentionally excluded, including all of their descendant folders and documents. All other current and newly added folders are included automatically. Folder additions and removals are reported separately; document additions, removals, renames, moves, and content modifications use the existing detailed change report.
 
+The 10 broken historical memo PDFs listed in `EXCLUDED_MEMO_FILENAMES` in `monitor.py`
+(dated 1996-06-04 through 2014-03-11) are also intentionally ignored. They are not downloaded,
+included in document warnings, or reported as removed when upgrading an existing baseline.
+Other memos, vegetation drawings, and the ProjectWise training document remain monitored.
+
 For modified files, the report also identifies PDF page numbers and text excerpts, Word paragraph changes, Excel sheet/cell changes, and text-file line changes. Modified PDF pages include low-resolution before/after previews, including drawings and scanned pages with no extractable text.
 
 Temporary rendering or download failures are retried with exponential backoff. Retries are scoped to the failed page render, dynamic link resolution, or individual document, so one unavailable file does not restart every completed download. A detected change is checked a second time after two minutes before anyone is notified. The monitor also keeps a local change-history dashboard and sends a quiet weekly health summary so the team knows monitoring is still operational.
