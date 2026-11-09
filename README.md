@@ -9,7 +9,14 @@ The 10 broken historical memo PDFs listed in `EXCLUDED_MEMO_FILENAMES` in `monit
 included in document warnings, or reported as removed when upgrading an existing baseline.
 Other memos, vegetation drawings, and the ProjectWise training document remain monitored.
 
-For modified files, the report also identifies PDF page numbers and text excerpts, Word paragraph changes, Excel sheet/cell changes, and text-file line changes. Modified PDF pages include low-resolution before/after previews, including drawings and scanned pages with no extractable text.
+For modified files, the report also identifies PDF page numbers and text excerpts, Word paragraph changes, Excel sheet/cell changes, and text-file line changes. Every detected changed PDF page gets a low-resolution before/after preview, including drawings and scanned pages with no extractable text. Previews are no longer limited to the first three changed pages. Added and removed pages show the available side; missing cached images are labeled as unavailable.
+
+PDF descriptions use short before/after text excerpts with surrounding context, distinguish
+visual-only changes from text changes, and include a sheet ID when it can be read directly
+after `WORKING NUMBER` in the extracted text. Page numbers refer to the PDF's page order;
+sheet IDs are separate labels. The excerpts describe extracted text, so review the page images
+for graphical revisions or text that the PDF does not extract cleanly. Reports with many
+changed pages will be larger because all changed-page previews are included.
 
 Temporary rendering or download failures are retried with exponential backoff. Retries are scoped to the failed page render, dynamic link resolution, or individual document, so one unavailable file does not restart every completed download. A detected change is checked a second time after two minutes before anyone is notified. The monitor also keeps a local change-history dashboard and sends a quiet weekly health summary so the team knows monitoring is still operational.
 

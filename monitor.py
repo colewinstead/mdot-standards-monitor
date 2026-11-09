@@ -1013,7 +1013,7 @@ def describe_pdf_changes(old: dict[str, object], new: dict[str, object]) -> list
     details: list[str] = []
     for old_page, new_page in changed_pdf_pages(old, new):
         page = new_page if new_page is not None else old_page
-        sheet = re.search(r"WORKING NUMBER\s*\n\s*([A-Z]{1,6}-[A-Z0-9]+)\s*\n", str(page.get("text", "")))
+        sheet = re.search(r"WORKING NUMBER\s*\n\s*([A-Z]{1,6}-[A-Z0-9]+)(?:\n|$)", str(page.get("text", "")))
         sheet_label = f" (sheet {sheet.group(1)})" if sheet else ""
         if old_page is None:
             details.append(f"New page {new_page['page']}{sheet_label} added")
